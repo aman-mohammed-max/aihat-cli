@@ -1,0 +1,453 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Rust CLI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            asset: UniversalMemory-Setup-x64.exe
+          - runner: windows-latest
+            target: i686-pc-windows-msvc
+            arch: x86
+            asset: UniversalMemory-Setup-x86.exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            asset: UniversalMemory-Setup-arm64.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build portable executable
+        shell: pwsh
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aihat.exe" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            label: Intel
+            asset: UniversalMemory-macOS-Intel.dmg
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+            label: AppleSilicon
+            asset: UniversalMemory-macOS-AppleSilicon.dmg
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and create disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}"
+          mkdir -p dist target/dmg-root
+          cp "target/${{ matrix.target }}/release/aihat" target/dmg-root/aihat
+          cat > target/dmg-root/install.sh <<'INSTALL'
+          #!/bin/sh
+          set -eu
+          destination="${1:-/usr/local/bin}"
+          mkdir -p "$destination"
+          install -m 0755 "$(dirname "$0")/aihat" "$destination/aihat"
+          echo "Installed aihat to $destination/aihat"
+          INSTALL
+          chmod +x target/dmg-root/install.sh
+          cat > target/dmg-root/README.txt <<'README'
+          AI Hat CLI for macOS
+
+          Run ./install.sh to install aihat into /usr/local/bin.
+          If permission is denied, run sudo ./install.sh.
+          README
+          hdiutil create -volname "UniversalMemory" \
+            -srcfolder target/dmg-root -ov -format UDZO "dist/${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/aihat" "dist/aihat-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-dmg-${{ matrix.arch }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-bin-${{ matrix.arch }}
+          path: dist/aihat-${{ matrix.arch }}
+          if-no-files-found: error
+
+  macos-universal:
+    name: macOS Universal
+    needs: macos
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: macos-bin-*
+          path: target/macos-binaries
+          merge-multiple: true
+      - name: Combine Apple Silicon and Intel builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist target/universal-dmg
+          lipo -create \
+            target/macos-binaries/aihat-x86_64 \
+            target/macos-binaries/aihat-aarch64 \
+            -output target/universal-dmg/aihat
+          cat > target/universal-dmg/install.sh <<'INSTALL'
+          #!/bin/sh
+          set -eu
+          destination="${1:-/usr/local/bin}"
+          mkdir -p "$destination"
+          install -m 0755 "$(dirname "$0")/aihat" "$destination/aihat"
+          echo "Installed aihat to $destination/aihat"
+          INSTALL
+          chmod +x target/universal-dmg/install.sh
+          cat > target/universal-dmg/README.txt <<'README'
+          Universal AI Hat CLI for Intel and Apple Silicon Macs.
+          Run ./install.sh to install aihat into /usr/local/bin.
+          README
+          hdiutil create -volname "UniversalMemory" \
+            -srcfolder target/universal-dmg -ov -format UDZO \
+            dist/UniversalMemory-macOS-Universal.dmg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-dmg-universal
+          path: dist/UniversalMemory-macOS-Universal.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.slug }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            nfpm_arch: amd64
+            slug: amd64
+            debian_arch: amd64
+            rpm_arch: x86_64
+            archlinux_arch: x86_64
+            apk_arch: x86_64
+            package_formats: "deb rpm archlinux"
+          - target: i686-unknown-linux-gnu
+            nfpm_arch: "386"
+            slug: i386
+            debian_arch: i386
+            rpm_arch: i386
+            archlinux_arch: i686
+            apk_arch: x86
+            package_formats: deb
+          - target: aarch64-unknown-linux-gnu
+            nfpm_arch: arm64
+            slug: arm64
+            debian_arch: arm64
+            rpm_arch: aarch64
+            archlinux_arch: aarch64
+            apk_arch: aarch64
+            package_formats: "deb rpm archlinux"
+          - target: armv7-unknown-linux-gnueabihf
+            nfpm_arch: arm7
+            slug: armhf
+            debian_arch: armhf
+            rpm_arch: armv7hl
+            archlinux_arch: armv7h
+            apk_arch: armv7
+            package_formats: deb
+          - target: riscv64gc-unknown-linux-gnu
+            nfpm_arch: riscv64
+            slug: riscv64
+            debian_arch: riscv64
+            rpm_arch: riscv64
+            archlinux_arch: riscv64
+            apk_arch: riscv64
+            package_formats: deb
+          - target: x86_64-unknown-linux-musl
+            nfpm_arch: amd64
+            slug: alpine-x86_64
+            debian_arch: amd64
+            rpm_arch: x86_64
+            archlinux_arch: x86_64
+            apk_arch: x86_64
+            package_formats: apk
+          - target: aarch64-unknown-linux-musl
+            nfpm_arch: arm64
+            slug: alpine-aarch64
+            debian_arch: arm64
+            rpm_arch: aarch64
+            archlinux_arch: aarch64
+            apk_arch: aarch64
+            package_formats: apk
+          - target: armv7-unknown-linux-musleabihf
+            nfpm_arch: arm7
+            slug: alpine-armv7
+            debian_arch: armhf
+            rpm_arch: armv7hl
+            archlinux_arch: armv7h
+            apk_arch: armv7
+            package_formats: apk
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Install cross compiler and package builder
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross --locked
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build and package
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+        run: |
+          chmod +x .github/scripts/package-linux.sh
+          .github/scripts/package-linux.sh \
+            "${{ matrix.target }}" \
+            "${{ matrix.nfpm_arch }}" \
+            "${{ matrix.package_formats }}" \
+            "${{ matrix.slug }}" \
+            "${{ matrix.debian_arch }}" \
+            "${{ matrix.rpm_arch }}" \
+            "${{ matrix.archlinux_arch }}" \
+            "${{ matrix.apk_arch }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.slug }}
+          path: dist/UniversalMemory-*
+          if-no-files-found: error
+
+  freebsd:
+    name: FreeBSD ${{ matrix.asset_arch }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vm_arch: x86_64
+            asset_arch: amd64
+          - vm_arch: aarch64
+            asset_arch: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          arch: ${{ matrix.vm_arch }}
+          prepare: pkg install -y rust
+          run: |
+            set -eu
+            cargo build --locked --release
+            VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+            if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
+            mkdir -p dist target/freebsd-root/usr/local/bin
+            cp target/release/aihat target/freebsd-root/usr/local/bin/aihat
+            cat > target/freebsd-manifest <<EOF
+            name: "aihat"
+            version: "$VERSION"
+            origin: "misc/aihat"
+            comment: "AI Hat terminal client"
+            maintainer: "AI Hat CLI maintainers <noreply@example.com>"
+            www: "https://github.com/aman-mohammed-max/aihat"
+            abi: "$(pkg config ABI)"
+            prefix: "/usr/local"
+            desc: "AI Hat terminal chat and command line client"
+            categories: [ misc ]
+            EOF
+            pkg create --manifest target/freebsd-manifest --root-dir target/freebsd-root --out-dir dist
+            package=$(find dist -maxdepth 1 -type f -name '*.pkg' | head -n 1)
+            test -n "$package"
+            mv "$package" "dist/UniversalMemory-freebsd-${{ matrix.asset_arch }}.pkg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-${{ matrix.asset_arch }}
+          path: dist/UniversalMemory-freebsd-*.pkg
+          if-no-files-found: error
+
+  freebsd-portable:
+    name: FreeBSD i386 portable binary
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-freebsd
+      - name: Install cross compiler
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Build portable executable
+        run: |
+          cross build --locked --release --target i686-unknown-freebsd
+          mkdir -p dist
+          tar -czf dist/UniversalMemory-freebsd-i386.tar.gz \
+            -C target/i686-unknown-freebsd/release aihat
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-i386
+          path: dist/UniversalMemory-freebsd-i386.tar.gz
+          if-no-files-found: error
+
+  openbsd:
+    name: OpenBSD ${{ matrix.asset_arch }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vm_arch: x86_64
+            asset_arch: amd64
+          - vm_arch: aarch64
+            asset_arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          arch: ${{ matrix.vm_arch }}
+          prepare: pkg_add rust
+          run: |
+            set -eu
+            cargo build --locked --release
+            VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+            if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
+            mkdir -p dist target/openbsd-root/usr/local/bin
+            cp target/release/aihat target/openbsd-root/usr/local/bin/aihat
+            printf 'bin/aihat\n' > target/openbsd-packing-list
+            pkg_create -A "$(uname -m)" \
+              -B target/openbsd-root \
+              -D "COMMENT=AI Hat CLI" \
+              -d "-AI Hat terminal chat and command line client" \
+              -f target/openbsd-packing-list \
+              -p /usr/local \
+              "target/aihat-${VERSION}.tgz"
+            mv "target/aihat-${VERSION}.tgz" \
+              "dist/UniversalMemory-openbsd-${{ matrix.asset_arch }}.tgz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openbsd-${{ matrix.asset_arch }}
+          path: dist/UniversalMemory-openbsd-*.tgz
+          if-no-files-found: error
+
+  netbsd:
+    name: NetBSD ${{ matrix.asset_arch }}
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vm_arch: x86_64
+            asset_arch: amd64
+          - vm_arch: aarch64
+            asset_arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/netbsd-vm@v1
+        with:
+          arch: ${{ matrix.vm_arch }}
+          prepare: /usr/sbin/pkg_add -u rust
+          run: |
+            set -eu
+            export PATH="/usr/pkg/bin:/usr/pkg/sbin:$PATH"
+            cargo build --locked --release
+            VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+            if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
+            mkdir -p /usr/local/bin dist target
+            install -m 0755 target/release/aihat /usr/local/bin/aihat
+            printf '@name aihat-%s\n@cwd /usr/local\nbin/aihat\n' "$VERSION" > target/netbsd-packing-list
+            pkg_create -c "AI Hat CLI" \
+              -d "-AI Hat terminal chat and command line client" \
+              -f target/netbsd-packing-list \
+              -p /usr/local \
+              "target/aihat-${VERSION}.tgz"
+            mv "target/aihat-${VERSION}.tgz" \
+              "dist/UniversalMemory-netbsd-${{ matrix.asset_arch }}.tgz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netbsd-${{ matrix.asset_arch }}
+          path: dist/UniversalMemory-netbsd-*.tgz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - test
+      - windows
+      - macos
+      - macos-universal
+      - linux
+      - freebsd
+      - freebsd-portable
+      - openbsd
+      - netbsd
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: downloads
+      - name: Collect release assets and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find downloads -type f -name 'UniversalMemory-*' -exec cp {} dist/ \;
+          test -n "$(find dist -maxdepth 1 -type f -name 'UniversalMemory-*' -print -quit)"
+          cd dist
+          sha256sum UniversalMemory-* > SHA256SUMS
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/UniversalMemory-* dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/UniversalMemory-* dist/SHA256SUMS \
+              --title "AI Hat CLI $GITHUB_REF_NAME" --generate-notes
+          fi

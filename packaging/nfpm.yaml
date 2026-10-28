@@ -1,0 +1,13 @@
+name: universal-memory
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${PACKAGE_VERSION}
+maintainer: AI Hat CLI maintainers
+description: AI Hat terminal chat and command line client
+license: MIT
+homepage: https://github.com/aman-mohammed-max/aihat
+contents:
+  - src: packaging/aihat
+    dst: /usr/bin/aihat
+    file_info:
+      mode: 0755
