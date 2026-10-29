@@ -22,47 +22,64 @@ const LOGO: [(&str, u16); 4] = [("▗▄▄▄▄▖", 1), ("▟█████�
 impl AboutDialog {
     pub fn draw(&self, buf: &mut Buffer, screen: Rect) {
         let t = theme();
-        let bio_width = 70usize;
-        let bio = wrap_segments(&[(BIO.to_string(), t.fg(Role::Text))], bio_width);
-        let rows = 20 + bio.len() as u16;
-        let area = draw::dialog_rect(screen, 76, rows + 2, 3);
+        let bio = wrap_segments(&[(BIO.to_string(), t.fg(Role::Text))], 70);
+        let full = 20 + bio.len() as u16;
+        let area = draw::dialog_rect(screen, 76, full + 2, 3);
         draw::boxed(buf, area, t.fg(Role::Accent), "About", "esc close");
         let inner = draw::inner(area);
         let right = inner.right();
-        let mut y = inner.y + 1;
+        // Short windows drop the logo, then the bio, so every link shows.
+        let logo = inner.height >= full;
+        let with_bio = inner.height >= full - 5;
+        let mut y = inner.y;
 
-        let beside = [
-            Line::styled("AI Hat", t.bold(Role::Strong)),
-            Line::styled(about::version_line(), t.fg(Role::Dim)),
-            Line::styled("Chat with any model, on your terms", t.fg(Role::Dim)),
-        ];
-        for (row, (logo, indent)) in LOGO.iter().enumerate() {
-            put(buf, inner.x + 1 + indent, y, logo, t.fg(Role::Accent), right);
-            if let Some(line) = beside.get(row) {
-                put_line(buf, inner.x + 12, y, line, right);
+        if logo {
+            y += 1;
+            let beside = [
+                Line::styled("AI Hat", t.bold(Role::Strong)),
+                Line::styled(about::version_line(), t.fg(Role::Dim)),
+                Line::styled("Chat with any model, on your terms", t.fg(Role::Dim)),
+            ];
+            for (row, (mark, indent)) in LOGO.iter().enumerate() {
+                put(buf, inner.x + 1 + indent, y, mark, t.fg(Role::Accent), right);
+                if let Some(line) = beside.get(row) {
+                    put_line(buf, inner.x + 12, y, line, right);
+                }
+                y += 1;
             }
+        } else {
+            put_line(
+                buf,
+                inner.x,
+                y,
+                &Line::from(vec![Span::styled("◆ AI Hat ", t.bold(Role::Accent)), Span::styled(about::version_line(), t.fg(Role::Dim))]),
+                right,
+            );
             y += 1;
         }
         y += 1;
 
         put(buf, inner.x, y, "MADE BY", t.fg(Role::Dim), right);
         y += 1;
-        put(buf, inner.x, y, MAKER, t.bold(Role::Strong), right);
-        y += 1;
-        put(buf, inner.x, y, ROLE, t.fg(Role::Text), right);
-        y += 1;
-        for row in bio {
-            if y >= inner.bottom() {
-                return;
+        if with_bio {
+            put(buf, inner.x, y, MAKER, t.bold(Role::Strong), right);
+            y += 1;
+            put(buf, inner.x, y, ROLE, t.fg(Role::Text), right);
+            y += 1;
+            for row in bio {
+                put_line(buf, inner.x, y, &Line::from(row), right);
+                y += 1;
             }
-            put_line(buf, inner.x, y, &Line::from(row), right);
+        } else {
+            put_line(buf, inner.x, y, &Line::from(vec![Span::styled(MAKER, t.bold(Role::Strong)), Span::styled(format!(" · {ROLE}"), t.fg(Role::Dim))]), right);
             y += 1;
         }
         y += 1;
 
-        let mut index = 0;
+        // The last row is for the keys.
+        let last = inner.bottom().saturating_sub(1);
         let link_row = |buf: &mut Buffer, y: u16, label: &str, detail: &str, detail_role: Role, index: usize| {
-            if y >= inner.bottom() {
+            if y >= last {
                 return;
             }
             let selected = index == self.selection;
@@ -74,23 +91,21 @@ impl AboutDialog {
             draw::row(buf, inner, y, line, selected);
             put(buf, right - 1, y, "›", if selected { t.fg(Role::Accent) } else { t.fg(Role::Dim) }, right);
         };
-        for link in &MAKER_LINKS {
+        for (index, link) in MAKER_LINKS.iter().enumerate() {
             link_row(buf, y, link.label, link.detail, Role::Link, index);
-            index += 1;
             y += 1;
         }
         y += 1;
-        if y < inner.bottom() {
+        if y < last {
             put(buf, inner.x, y, "ABOUT THE APP", t.fg(Role::Dim), right);
         }
         y += 1;
-        for link in &APP_LINKS {
-            link_row(buf, y, link.label, link.detail, Role::Dim, index);
-            index += 1;
+        for (index, link) in APP_LINKS.iter().enumerate() {
+            link_row(buf, y, link.label, link.detail, Role::Dim, MAKER_LINKS.len() + index);
             y += 1;
         }
         let hint = "↑↓ move · enter open in your browser · c copy the link · esc close";
-        put(buf, inner.x, inner.bottom() - 1, &text::truncate(hint, inner.width as usize), t.fg(Role::Dim), right);
+        put(buf, inner.x, last, &text::truncate(hint, inner.width as usize), t.fg(Role::Dim), right);
     }
 
     /// Returns whether the dialog stays open.

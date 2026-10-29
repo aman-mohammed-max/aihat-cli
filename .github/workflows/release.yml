@@ -267,10 +267,14 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+          # There is no go.mod to key a cache on.
+          cache: false
       - name: Install cross compiler and package builder
         run: |
-          cargo install cross --git https://github.com/cross-rs/cross --locked
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          # Downloads fail now and then; try again before giving up.
+          retry() { for wait in 0 20 60; do sleep "$wait"; "$@" && return 0; done; return 1; }
+          retry cargo install cross --git https://github.com/cross-rs/cross --locked
+          retry go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Build and package
         env:
@@ -375,7 +379,9 @@ jobs:
         with:
           targets: i686-unknown-freebsd
       - name: Install cross compiler
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+        run: |
+          retry() { for wait in 0 20 60; do sleep "$wait"; "$@" && return 0; done; return 1; }
+          retry cargo install cross --git https://github.com/cross-rs/cross --locked
       - name: Build portable executable
         run: |
           cross build --locked --release --target i686-unknown-freebsd
@@ -463,24 +469,28 @@ jobs:
             STEP="package"
             VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
             if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
-            mkdir -p /usr/local/bin dist target
-            install -m 0755 target/release/aihat /usr/local/bin/aihat
-            printf '@name aihat-%s\n@cwd /usr/local\nbin/aihat\n' "$VERSION" > target/netbsd-packing-list
+            # Work in a folder of the VM's own: files made in the synced
+            # checkout take its group (the runner's, which the VM lacks).
+            work=/tmp/aihat-package
+            mkdir -p /usr/local/bin dist "$work"
+            install -o root -g wheel -m 0755 target/release/aihat /usr/local/bin/aihat
+            printf '@name aihat-%s\n@cwd /usr/local\nbin/aihat\n' "$VERSION" > "$work/packing-list"
             # pkg_add checks these to see the package suits the system.
             printf 'OPSYS=NetBSD\nOS_VERSION=%s\nMACHINE_ARCH=%s\nPKGTOOLS_VERSION=%s\n' \
-              "$(uname -r)" "$(uname -p)" "$(pkg_info -V)" > target/netbsd-build-info
+              "$(uname -r)" "$(uname -p)" "$(pkg_info -V)" > "$work/build-info"
             # A leading "-" makes -c and -d take the text itself, not a file name.
-            if ! pkg_create -c "-AI Hat CLI" \
+            if ! (cd "$work" && pkg_create -u root -g wheel \
+              -c "-AI Hat CLI" \
               -d "-AI Hat terminal chat and command line client" \
-              -B target/netbsd-build-info \
-              -f target/netbsd-packing-list \
+              -B build-info \
+              -f packing-list \
               -p /usr/local \
-              "target/aihat-${VERSION}.tgz" > target/pkg_create.log 2>&1; then
-              cat target/pkg_create.log
-              echo "::error title=pkg_create::$(tr '\n' ' ' < target/pkg_create.log)"
+              "aihat-${VERSION}.tgz") > "$work/pkg_create.log" 2>&1; then
+              cat "$work/pkg_create.log"
+              echo "::error title=pkg_create::$(tr '\n' ' ' < "$work/pkg_create.log")"
               exit 1
             fi
-            mv "target/aihat-${VERSION}.tgz" \
+            mv "$work/aihat-${VERSION}.tgz" \
               "dist/aihat-netbsd-${{ matrix.asset_arch }}.tgz"
       - uses: actions/upload-artifact@v7
         with:
