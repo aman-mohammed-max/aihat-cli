@@ -147,6 +147,14 @@ pub struct ModelPicker {
     query: String,
     selected: Option<usize>,
     make_default: bool,
+    /// The widest the name column may be on this screen (set when drawn).
+    name_cap: std::cell::Cell<usize>,
+}
+
+/// The name column: as wide as the longest model name, at least the
+/// design's 23 columns.
+fn model_name_width(app: &App) -> usize {
+    app.db.models(None).unwrap_or_default().iter().filter(|m| m.enabled && m.is_chat()).map(|m| width(&m.id) + 1).max().unwrap_or(0).max(23)
 }
 
 impl ModelPicker {
@@ -155,6 +163,7 @@ impl ModelPicker {
             query: String::new(),
             selected: None,
             make_default: false,
+            name_cap: std::cell::Cell::new(usize::MAX),
         };
         let rows = picker.rows(app);
         let current = app.current_selection().map(|(p, m)| (p.id, m));
@@ -167,6 +176,7 @@ impl ModelPicker {
 
     fn rows(&self, app: &App) -> Vec<PickRow<(String, String)>> {
         let t = theme();
+        let name_cols = model_name_width(app).min(self.name_cap.get());
         let current = app.current_selection().map(|(p, m)| (p.id, m));
         let settings = app.db.settings();
         let default_model = settings.get("defaultModelId").and_then(Value::as_str).map(str::to_owned);
@@ -213,7 +223,7 @@ impl ModelPicker {
                 let marker_style = if is_current { t.fg(Role::Accent) } else { style };
                 let line = Line::from(vec![
                     Span::styled(marker, marker_style),
-                    Span::styled(text::pad(&model.id, 23), style),
+                    Span::styled(text::pad(&model.id, name_cols), style),
                     Span::styled(text::pad(&caps, 18), style),
                     Span::styled(if is_default { "default" } else { "" }, style),
                 ]);
@@ -225,6 +235,12 @@ impl ModelPicker {
 
     fn draw(&self, app: &App, buf: &mut Buffer, screen: Rect) {
         let t = theme();
+        // Wide enough for the longest name (marker, name, capabilities,
+        // "default", borders), as the design's 64 columns when names fit.
+        let room = screen.width.saturating_sub(4) as usize;
+        self.name_cap.set(room.saturating_sub(2 + 18 + 7 + 4).max(12));
+        let name_cols = model_name_width(app).min(self.name_cap.get());
+        let dialog_width = (2 + name_cols + 18 + 7 + 4).max(64).min(room.max(40)) as u16;
         let rows = self.rows(app);
         let rows: Vec<PickRow<(String, String)>> = rows
             .into_iter()
@@ -236,7 +252,7 @@ impl ModelPicker {
             .collect();
         let count = rows.iter().filter(|r| matches!(r, PickRow::Item(..))).count();
         let visible = rows.len().clamp(1, 12);
-        let area = draw::dialog_rect(screen, 64, visible as u16 + 6, 5);
+        let area = draw::dialog_rect(screen, dialog_width, visible as u16 + 6, 5);
         let title = if self.make_default { "Default model" } else { "Switch model" };
         draw::boxed(buf, area, t.fg(Role::Accent), title, "");
         let inner = draw::inner(area);
