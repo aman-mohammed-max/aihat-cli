@@ -151,10 +151,12 @@ pub fn fit_cells(w: u32, h: u32, max_cols: u16, max_rows: u16, aspect: f64) -> (
 const CELL_W: usize = 8;
 const CELL_H: usize = 16;
 
-/// Block symbols and the part of the cell each one covers, as rectangles
-/// (x0, y0, x1, y1) in a cell's 8×16 pixels. Shapes that are another's
-/// opposite (▀ is ▄ with the colours swapped) are left out.
-const SHAPES: [(&str, &[(usize, usize, usize, usize)]); 20] = [
+/// Part of a cell: (x0, y0, x1, y1) in its 8×16 pixels.
+type Part = (usize, usize, usize, usize);
+
+/// Block symbols and the parts of the cell each one covers. Shapes that are
+/// another's opposite (▀ is ▄ with the colours swapped) are left out.
+const SHAPES: [(&str, &[Part]); 20] = [
     ("▁", &[(0, 14, 8, 16)]),
     ("▂", &[(0, 12, 8, 16)]),
     ("▃", &[(0, 10, 8, 16)]),
@@ -220,7 +222,7 @@ fn symbols_at(image: &DynamicImage, cols: u16, rows: u16, depth: Depth) -> Optio
                             }
                         }
                     }
-                    let rect = |(x0, y0, x1, y1): (usize, usize, usize, usize)| -> [f32; 3] {
+                    let rect = |(x0, y0, x1, y1): Part| -> [f32; 3] {
                         std::array::from_fn(|c| sums[y1][x1][c] - sums[y0][x1][c] - sums[y1][x0][c] + sums[y0][x0][c])
                     };
                     let total = rect((0, 0, CELL_W, CELL_H));
