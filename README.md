@@ -195,10 +195,10 @@ A key is written like `ctrl+p`, `alt+enter`, `shift+tab`, `f2` or a single chara
 | --- | --- |
 | Windows | `aihat-windows-x64.exe`, `-x86.exe`, `-arm64.exe` (portable, nothing to install) |
 | macOS | `aihat-macos-universal.dmg`, `-apple-silicon.dmg`, `-intel.dmg` |
-| Debian, Ubuntu, Mint… | `aihat-debian-{amd64,i386,arm64,armhf,riscv64}.deb` |
-| Fedora, RHEL, openSUSE… | `aihat-fedora-{x86_64,aarch64}.rpm` |
-| Arch, Manjaro… | `aihat-arch-{x86_64,aarch64}.pkg.tar.zst` |
-| Alpine | `aihat-alpine-{x86_64,aarch64,armv7}.apk` |
+| Debian, Ubuntu, Mint, Raspberry Pi OS… | `aihat-debian-{amd64,i386,arm64,armhf,riscv64}.deb` |
+| Fedora, RHEL, openSUSE… | `aihat-fedora-{x86_64,i686,aarch64,armv7hl,riscv64}.rpm` |
+| Arch, Manjaro, Arch Linux ARM… | `aihat-arch-{x86_64,i686,aarch64,armv7h,riscv64}.pkg.tar.zst` |
+| Alpine | `aihat-alpine-{x86_64,x86,aarch64,armv7,riscv64}.apk` |
 | Any Linux | `aihat-linux-*.tar.gz` (the `musl-*` ones are static and run on any distribution) |
 | FreeBSD | `aihat-freebsd-{amd64,aarch64}.pkg`, `aihat-freebsd-i386.tar.gz` |
 | OpenBSD | `aihat-openbsd-{amd64,arm64}.tgz` (`pkg_add -D unsigned`) |

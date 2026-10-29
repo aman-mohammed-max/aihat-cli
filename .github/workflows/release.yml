@@ -176,9 +176,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every Linux CPU: x86_64, x86 (32-bit), ARM64, ARM32 (v7) and RISC-V 64.
         include:
           - target: x86_64-unknown-linux-gnu
-            nfpm_arch: amd64
+            nfpm_arch: "amd64"
             slug: amd64
             debian_arch: amd64
             rpm_arch: x86_64
@@ -189,12 +190,12 @@ jobs:
             nfpm_arch: "386"
             slug: i386
             debian_arch: i386
-            rpm_arch: i386
+            rpm_arch: i686
             archlinux_arch: i686
             apk_arch: x86
-            package_formats: deb
+            package_formats: "deb rpm archlinux"
           - target: aarch64-unknown-linux-gnu
-            nfpm_arch: arm64
+            nfpm_arch: "arm64"
             slug: arm64
             debian_arch: arm64
             rpm_arch: aarch64
@@ -202,45 +203,61 @@ jobs:
             apk_arch: aarch64
             package_formats: "deb rpm archlinux"
           - target: armv7-unknown-linux-gnueabihf
-            nfpm_arch: arm7
+            nfpm_arch: "arm7"
             slug: armhf
             debian_arch: armhf
             rpm_arch: armv7hl
             archlinux_arch: armv7h
             apk_arch: armv7
-            package_formats: deb
+            package_formats: "deb rpm archlinux"
           - target: riscv64gc-unknown-linux-gnu
-            nfpm_arch: riscv64
+            nfpm_arch: "riscv64"
             slug: riscv64
             debian_arch: riscv64
             rpm_arch: riscv64
             archlinux_arch: riscv64
             apk_arch: riscv64
-            package_formats: deb
+            package_formats: "deb rpm archlinux"
           - target: x86_64-unknown-linux-musl
-            nfpm_arch: amd64
+            nfpm_arch: "amd64"
             slug: musl-x86_64
             debian_arch: amd64
             rpm_arch: x86_64
             archlinux_arch: x86_64
             apk_arch: x86_64
-            package_formats: apk
+            package_formats: "apk"
+          - target: i686-unknown-linux-musl
+            nfpm_arch: "386"
+            slug: musl-x86
+            debian_arch: i386
+            rpm_arch: i686
+            archlinux_arch: i686
+            apk_arch: x86
+            package_formats: "apk"
           - target: aarch64-unknown-linux-musl
-            nfpm_arch: arm64
+            nfpm_arch: "arm64"
             slug: musl-aarch64
             debian_arch: arm64
             rpm_arch: aarch64
             archlinux_arch: aarch64
             apk_arch: aarch64
-            package_formats: apk
+            package_formats: "apk"
           - target: armv7-unknown-linux-musleabihf
-            nfpm_arch: arm7
+            nfpm_arch: "arm7"
             slug: musl-armv7
             debian_arch: armhf
             rpm_arch: armv7hl
             archlinux_arch: armv7h
             apk_arch: armv7
-            package_formats: apk
+            package_formats: "apk"
+          - target: riscv64gc-unknown-linux-musl
+            nfpm_arch: "riscv64"
+            slug: musl-riscv64
+            debian_arch: riscv64
+            rpm_arch: riscv64
+            archlinux_arch: riscv64
+            apk_arch: riscv64
+            package_formats: "apk"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -266,11 +283,32 @@ jobs:
             "${{ matrix.rpm_arch }}" \
             "${{ matrix.archlinux_arch }}" \
             "${{ matrix.apk_arch }}"
+      # One download per package, named after the system it is for.
       - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.slug }}
-          path: dist/aihat-*
+          path: dist/aihat-linux-*.tar.gz
           if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: debian-${{ matrix.debian_arch }}
+          path: dist/aihat-debian-*.deb
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fedora-${{ matrix.rpm_arch }}
+          path: dist/aihat-fedora-*.rpm
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arch-${{ matrix.archlinux_arch }}
+          path: dist/aihat-arch-*.pkg.tar.zst
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: alpine-${{ matrix.apk_arch }}
+          path: dist/aihat-alpine-*.apk
+          if-no-files-found: ignore
 
   freebsd:
     name: FreeBSD ${{ matrix.asset_arch }}
