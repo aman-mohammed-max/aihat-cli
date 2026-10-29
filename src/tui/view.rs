@@ -51,6 +51,7 @@ pub const COMMANDS: &[Command] = &[
     command("settings", "open settings.json", None, false),
     // After the design's list: commands added since.
     command("folder", "let the assistant read this folder · run commands", None, false),
+    command("voice", "speak instead of typing", Some(Action::Voice), false),
     command("market", "find skills and MCP servers to add", None, false),
     command("effort", "how much the model thinks: off, low, medium, high", None, false),
     command("newprompt", "describe an assistant · the model writes its system prompt", None, true),
@@ -422,6 +423,9 @@ fn placeholder(app: &App, narrow: bool) -> String {
     if let Page::Market(_) = app.page {
         return "/market · type to search · esc back to chat".into();
     }
+    if app.recording.is_some() {
+        return format!("Listening… speak now · {} or enter stops · esc cancels", keys::label(Action::Voice));
+    }
     if let Some(turn) = &app.turn {
         if turn.approval.is_some() {
             return "Waiting for your answer…".into();
@@ -551,6 +555,11 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
                 if !context.is_empty() {
                     right.push(Span::styled(format!(" · {context}"), dim));
                 }
+            } else if let Some(recording) = &app.recording {
+                let dot = if super::anim::pulse() { t.fg(Role::Error) } else { t.fg(Role::Dim) };
+                let seconds = recording.started.elapsed().as_secs();
+                right.push(Span::styled("●", dot));
+                right.push(Span::styled(format!(" listening {}:{:02}", seconds / 60, seconds % 60), t.fg(Role::Warn)));
             } else if let Some(task) = &app.busy_task {
                 right.push(Span::styled(format!("{} {task}", super::anim::spinner()), t.fg(Role::Warn)));
             } else {

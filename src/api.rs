@@ -784,6 +784,24 @@ pub fn mcp_notify(
     Ok(())
 }
 
+/// Speech to text through an OpenAI-compatible `/audio/transcriptions`
+/// endpoint; with a provider, its key and headers go along.
+pub fn transcribe(base_url: &str, provider: Option<(&Provider, &Secrets)>, model: &str, audio: Vec<u8>) -> Result<String> {
+    let part = reqwest::blocking::multipart::Part::bytes(audio).file_name("speech.wav").mime_str("audio/wav")?;
+    let form = reqwest::blocking::multipart::Form::new().text("model", model.to_string()).text("response_format", "json").part("file", part);
+    let url = format!("{}/audio/transcriptions", base_url.trim_end_matches('/'));
+    let mut request = client(120_000)?.post(&url).multipart(form);
+    if let Some((provider, secrets)) = provider {
+        let mut extra = headers(provider, secrets)?;
+        // The form sets its own content type.
+        extra.remove(CONTENT_TYPE);
+        request = request.headers(extra);
+    }
+    let response = request.send().with_context(|| format!("Couldn't reach the speech endpoint at {url}"))?;
+    let value: Value = ensure_success(response)?.json().context("the speech endpoint sent something unreadable")?;
+    value.get("text").and_then(Value::as_str).map(str::to_owned).context("the speech endpoint sent no text")
+}
+
 fn headers(provider: &Provider, secrets: &Secrets) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

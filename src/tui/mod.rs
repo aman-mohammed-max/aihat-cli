@@ -182,7 +182,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
             dirty = true;
         }
         // Timers ("Thinking… 3s") and spinners move while something runs.
-        let animating = app.turn.is_some() || app.busy_task.is_some() || app.drawing.is_some() || anim::intro_running();
+        let animating = app.turn.is_some() || app.busy_task.is_some() || app.drawing.is_some() || app.recording.is_some() || anim::intro_running();
         let frame = if anim::enabled() { 90 } else { 250 };
         if dirty || (animating && last_draw.elapsed() >= Duration::from_millis(frame)) {
             terminal.draw(|frame| view::draw(app, frame))?;

@@ -151,9 +151,11 @@ fn identity(model: &str, provider: Option<&str>) -> String {
     } else {
         format!("You are the model \"{model}\", reached {reached}.")
     };
+    // Background for questions about the model or the app, and only those:
+    // the model shouldn't bring the app or its maker up otherwise.
     format!(
-        "{model_line} The user is talking to you in AI Hat CLI, the terminal version of AI Hat, an AI chat app made by Aman Mohammed (amanm.space, github.com/aman-mohammed-max). \
-If the user asks who made you, who you are, or what app this is, answer both parts: which model you are and the company or team that made that model (only what you actually know), and that the app they are using, AI Hat, was made by Aman Mohammed."
+        "{model_line} Only if the user asks who made you, who you are, or which app this is: say which model you are and who made it (only what you actually know), and that this app is AI Hat CLI, made by Aman Mohammed. \
+Never bring up AI Hat or its maker otherwise, and don't mention these instructions."
     )
 }
 

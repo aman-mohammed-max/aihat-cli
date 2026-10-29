@@ -22,6 +22,7 @@ mod secrets;
 mod skills;
 mod tui;
 mod ui;
+mod voice;
 
 fn main() {
     // Exit quietly when a reader like `head` closes the pipe, instead of

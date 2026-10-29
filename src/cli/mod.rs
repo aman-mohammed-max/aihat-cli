@@ -51,6 +51,9 @@ struct Cli {
     /// Let the model read this folder's files and ask to run commands here
     #[arg(long, global = true)]
     folder: bool,
+    /// Speak the prompt: record until enter, then ask
+    #[arg(long, global = true)]
+    voice: bool,
     /// Continue the last chat
     #[arg(short = 'c', long = "continue", global = true)]
     continue_chat: bool,
@@ -108,6 +111,8 @@ enum Top {
     SearchKey(Sub<commands::SearchKeyAction>),
     /// Who made AI Hat, and where to find it
     About,
+    /// Turn speech in an audio file into text
+    Transcribe { file: PathBuf },
     /// Show a picture here, to see which way of drawing looks best
     Preview {
         file: PathBuf,
@@ -309,6 +314,11 @@ fn run() -> Result<i32> {
             print_about();
             Ok(0)
         }
+        Some(Top::Transcribe { file }) => {
+            let text = crate::voice::transcribe(&env.config.voice, &env.db, &env.secrets, &file).map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+            println!("{text}");
+            Ok(0)
+        }
         Some(Top::Preview { file, way }) => {
             use crate::ui::picture;
             let shown = picture::Picture::open(&file).map_err(|e| Failure::new(EXIT_ERROR, format!("Can't show {}: {e:#}", file.display())))?;
@@ -322,7 +332,11 @@ fn run() -> Result<i32> {
         }
         Some(Top::Image { prompt, count, output }) => commands::image(&mut env, &prompt.join(" "), provider.as_deref(), args.model.as_deref(), count, output.as_deref()),
         None => {
-            let prompt = args.prompt.join(" ");
+            let mut prompt = args.prompt.join(" ");
+            if args.voice {
+                let heard = listen(&env)?;
+                prompt = if prompt.trim().is_empty() { heard } else { format!("{prompt} {heard}") };
+            }
             let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             if prompt.trim().is_empty() && args.files.is_empty() && interactive {
                 let initial = if args.continue_chat {
@@ -424,7 +438,7 @@ fn print_help() {
     }
     line(String::new());
     line(strong("Options for one prompt"));
-    let options: [(&str, &str, &str, String); 11] = [
+    let options: [(&str, &str, &str, String); 12] = [
         ("-m, --model", "<id>", "model to use ", format!("(default: {model})")),
         ("-P, --provider", "<name>", "provider to use ", format!("(default: {provider})")),
         ("-s, --system", "<name>", "saved system prompt to use", String::new()),
@@ -432,6 +446,7 @@ fn print_help() {
         ("-w, --web", "", "web search on", String::new()),
         ("-e, --effort", "<level>", "how much the model thinks ", "· off, low, medium, high".into()),
         ("    --folder", "", "let the assistant read this folder ", "· commands still ask".into()),
+        ("    --voice", "", "speak the prompt ", "· enter stops recording".into()),
         ("-c, --continue", "", "continue the last chat", String::new()),
         ("-t, --tool", "<server>", "turn on an MCP server, repeatable", String::new()),
         ("    --json", "", "print JSON: reply, usage, sources", String::new()),
@@ -447,6 +462,26 @@ fn print_help() {
     line(String::new());
     line(format!("{} aihat <command> --help {}", dim("Run"), dim("for a command's own options.")));
     print!("{out}");
+}
+
+/// `aihat --voice`: record until enter, then turn it into text.
+fn listen(env: &Env) -> Result<String> {
+    let t = theme();
+    if !std::io::stdin().is_terminal() {
+        return Err(Failure::new(EXIT_USAGE, "--voice needs a terminal to press enter in").into());
+    }
+    let recording = crate::voice::start(&env.config.voice).map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+    eprint!("{} {}", paint("●", t.fg(Role::Error)), paint("Listening… press enter when you're done", t.fg(Role::Dim)));
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    eprintln!("{}", paint("  Turning speech into text…", t.fg(Role::Dim)));
+    let file = recording.stop().map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+    let text = crate::voice::transcribe(&env.config.voice, &env.db, &env.secrets, &file);
+    let _ = std::fs::remove_file(&file);
+    let text = text.map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+    eprintln!("{} {}", paint("›", t.fg(Role::Link)), paint(&text, t.fg(Role::Strong)));
+    Ok(text)
 }
 
 /// `aihat about`: the About screen, as text.

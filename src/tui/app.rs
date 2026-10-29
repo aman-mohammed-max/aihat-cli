@@ -100,6 +100,10 @@ pub enum Task {
     SkillInstalledGlobally {
         result: Result<(String, std::path::PathBuf), String>,
     },
+    /// Speech turned into text (or why not).
+    Transcribed {
+        result: Result<String, String>,
+    },
     /// The model wrote a system prompt: its name and text.
     PromptWritten {
         result: Result<(String, String), String>,
@@ -174,6 +178,8 @@ pub struct App {
     pub dialog: Option<Dialog>,
     /// The folder aihat runs in, and what the person said about it.
     pub folder: Option<FolderAccess>,
+    /// Listening to the microphone (ctrl+t).
+    pub recording: Option<crate::voice::Recording>,
     pub popup_selection: usize,
     pub popup_dismissed: Option<String>,
     pub turn: Option<ActiveTurn>,
@@ -243,6 +249,7 @@ impl App {
             page: Page::Chat,
             dialog: None,
             folder: None,
+            recording: None,
             popup_selection: 0,
             popup_dismissed: None,
             turn: None,
@@ -899,6 +906,7 @@ impl App {
             "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
             "about" | "version" => self.dialog = Some(Dialog::About(Default::default())),
+            "voice" | "talk" | "speak" => self.toggle_voice(),
             "folder" | "workspace" | "access" => super::folder::command(self, args),
             "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
@@ -1490,6 +1498,17 @@ impl App {
                 self.dialog = Some(Dialog::Form(dialogs::Form::mcp_token(&id, &name)));
                 self.notify(Role::Warn, format!("{name} needs an access token"));
             }
+            Task::Transcribed { result } => match result {
+                Ok(text) => {
+                    let before = self.composer.text().to_string();
+                    if !before.is_empty() && !before.ends_with(char::is_whitespace) {
+                        self.composer.insert(" ");
+                    }
+                    self.composer.insert(&text);
+                    self.ok(format!("{} sends it", keys::label(Action::Send)));
+                }
+                Err(error) => self.fail(error),
+            },
             Task::PromptWritten { result } => match result {
                 Ok((name, body)) => match self.db.add_prompt_tagged(&name, &body, &["generated"]) {
                     Ok(id) => {
@@ -1800,7 +1819,48 @@ impl App {
         self.files.matches(&query, 4)
     }
 
+    /// ctrl+t: start listening, or stop and turn the speech into text, which
+    /// lands in the message box to check before sending.
+    pub fn toggle_voice(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            self.busy_task = Some("turning speech into text".into());
+            let ctx = self.ctx.clone();
+            let voice = self.config.voice.clone();
+            self.spawn_task(move || {
+                let result = recording.stop().and_then(|file| {
+                    let text = crate::db::Database::open(&ctx.db_path).and_then(|db| crate::voice::transcribe(&voice, &db, &ctx.secrets, &file));
+                    let _ = std::fs::remove_file(&file);
+                    text
+                });
+                Task::Transcribed { result: result.map_err(|e| format!("{e:#}")) }
+            });
+            return;
+        }
+        match crate::voice::start(&self.config.voice) {
+            Ok(recording) => {
+                self.recording = Some(recording);
+                self.notify(Role::Accent, format!("Listening… {} or enter stops · esc cancels", keys::label(Action::Voice)));
+            }
+            Err(error) => self.fail(format!("{error:#}")),
+        }
+    }
+
     fn chat_key(&mut self, key: KeyEvent) {
+        // While listening: enter or the voice key stops, esc cancels.
+        if self.recording.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(recording) = self.recording.take() {
+                        recording.cancel();
+                    }
+                    self.notify(Role::Dim, "Stopped listening");
+                }
+                KeyCode::Enter => self.toggle_voice(),
+                _ if keys::is(Action::Voice, &key) => self.toggle_voice(),
+                _ => {}
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1825,6 +1885,7 @@ impl App {
                 Action::ClearScreen => self.clear_screen(),
                 Action::ToggleReasoning => self.toggle_reasoning(),
                 Action::CopyReply => self.copy_last_reply(),
+                Action::Voice => self.toggle_voice(),
                 Action::ShowKeys => self.dialog = Some(Dialog::Keys),
                 Action::Quit => self.ctrl_c(),
             }

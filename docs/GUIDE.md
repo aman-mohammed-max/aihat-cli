@@ -126,6 +126,21 @@ Allowed, the assistant can list, read and search the files in the folder and the
 
 From the shell, `aihat --folder "why do the tests fail?"` lets it read the folder for that prompt; without `--folder` it asks on the terminal the first time it looks. Commands always ask (`--yes` allows them).
 
+## Speaking
+
+**Ctrl+T** (or `/voice`) starts listening; Ctrl+T again or enter stops, esc cancels. The words land in the message box, to check before sending. From the shell, `aihat --voice` records until you press enter, then asks the model, and `aihat transcribe recording.wav` prints what a file says.
+
+Recording uses what the computer has: PipeWire (`pw-record`), PulseAudio (`parecord`), ALSA (`arecord`), SoX or ffmpeg; `voice.record` in settings.json can name another command that records to `{file}`. On a Chromebook, turn on Settings › Linux › Allow Linux to access your microphone.
+
+Speech becomes text one of two ways (`voice.engine`):
+
+- **Offline, with Phonon-2**, an English speech model of 164 MB that runs on the CPU: `pip install fermion-research` puts the `phonon` command on your PATH, and aihat uses it when it's there (`auto`, the default) or always (`phonon`).
+- **Online**, through any OpenAI-compatible `/audio/transcriptions` endpoint (`endpoint`): your default provider, or `voice.url`, for example `phonon serve --port 8010` gives `http://127.0.0.1:8010/v1`. `voice.model` names the model (default `whisper-1`).
+
+```json
+"voice": { "engine": "auto", "url": "", "model": "", "record": "" }
+```
+
 ## Pasting
 
 **Ctrl+V** pastes from the clipboard: a picture goes with your next message (the message box says `+ picture · esc removes`), files copied in a file manager are attached, and text is typed in. Dragging a picture file into the terminal attaches it too.
@@ -216,7 +231,7 @@ Options live in `~/.config/aihat/settings.json` (`aihat config path` shows every
   "width": 0,
   "show_reasoning": false,
   "show_stats": true,
-  "mouse": true,
+  "mouse": false,
   "animations": true,
   "images": { "preview": "auto", "save_to": "~/Downloads" },
   "skills": { "use_global": true, "off": [] },

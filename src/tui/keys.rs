@@ -16,6 +16,8 @@ pub enum Action {
     ClearScreen,
     ToggleReasoning,
     CopyReply,
+    /// Start and stop speaking.
+    Voice,
     ShowKeys,
     Quit,
 }
@@ -128,7 +130,7 @@ static KEYMAP: OnceLock<Keymap> = OnceLock::new();
 /// could not be read; those actions keep their default key.
 pub fn init(config: &KeyConfig) -> Vec<String> {
     let defaults = KeyConfig::default();
-    let entries: [(Action, &str, &Keys, &Keys); 12] = [
+    let entries: [(Action, &str, &Keys, &Keys); 13] = [
         (Action::Send, "send", &config.send, &defaults.send),
         (Action::NewLine, "new_line", &config.new_line, &defaults.new_line),
         (Action::Stop, "stop", &config.stop, &defaults.stop),
@@ -139,6 +141,7 @@ pub fn init(config: &KeyConfig) -> Vec<String> {
         (Action::ClearScreen, "clear_screen", &config.clear_screen, &defaults.clear_screen),
         (Action::ToggleReasoning, "toggle_reasoning", &config.toggle_reasoning, &defaults.toggle_reasoning),
         (Action::CopyReply, "copy_reply", &config.copy_reply, &defaults.copy_reply),
+        (Action::Voice, "voice", &config.voice, &defaults.voice),
         (Action::ShowKeys, "show_keys", &config.show_keys, &defaults.show_keys),
         (Action::Quit, "quit", &config.quit, &defaults.quit),
     ];

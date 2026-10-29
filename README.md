@@ -167,6 +167,7 @@ Already use the AI Hat app on this computer? Your providers, prompts and chats a
 - **✍️ Writes system prompts for you.** `/prompt a patient Rust tutor` and the model writes one, saves it and uses it in the chat.
 - **🧠 Remembers you.** Your name, projects and preferences carry across chats. See and edit them with `/memory`.
 - **⌨️ Works your way.** Every shortcut, colour and option is in one file: `aihat config edit`.
+- **🎙️ Talk to it.** Press **Ctrl+T** in the chat, or run `aihat --voice`, and speak. Speech turns into text on your computer with [Phonon-2](https://huggingface.co/FermionResearch/Phonon-2) (offline, `pip install fermion-research`), or through any speech endpoint.
 - **📁 Works in your folder.** When the assistant wants to look at the files in the folder you started it in, it asks you first (or allow it ahead of time: `/folder allow`, or `aihat --folder` from the shell). It also asks before running any command there.
 - **🔒 Private by default.** Chats stay on your computer. API keys go to your system keychain (or a private file only you can read on Linux and BSD). Nothing leaves your computer except what goes to the models, search and tools you set up.
 
@@ -185,6 +186,7 @@ Already use the AI Hat app on this computer? Your providers, prompts and chats a
 | **/** | All commands |
 | **@** | Attach a file |
 | **Ctrl+V** | Paste a picture or copied files (or drag a picture in) |
+| **Ctrl+T** | Speak instead of typing (again or enter to stop) |
 | **?** | Every key |
 | **Ctrl+C** twice | Quit |
 

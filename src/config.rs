@@ -78,15 +78,38 @@ pub struct AppConfig {
     pub width: u16,
     pub show_reasoning: bool,
     pub show_stats: bool,
-    /// The mouse wheel scrolls the chat and buttons can be clicked. Hold
-    /// shift to select text with the mouse while this is on.
+    /// The mouse wheel scrolls the chat and buttons can be clicked, but the
+    /// terminal can't select text while this is on (some allow shift+drag).
     pub mouse: bool,
     /// Spinners, the pulsing dot and the other small animations.
     pub animations: bool,
     pub images: ImageConfig,
     pub search: SearchConfig,
     pub skills: SkillsConfig,
+    pub voice: VoiceConfig,
     pub keys: KeyConfig,
+}
+
+/// Speaking instead of typing (ctrl+t in the chat, `aihat --voice`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// auto (Phonon-2 on this computer when installed, else the endpoint),
+    /// phonon, or endpoint.
+    pub engine: String,
+    /// An OpenAI-compatible speech endpoint, like http://127.0.0.1:8010/v1
+    /// from `phonon serve`. Empty: the default provider.
+    pub url: String,
+    /// The model the endpoint should use. Empty: whisper-1.
+    pub model: String,
+    /// A command that records to {file}, when the usual recorders don't fit.
+    pub record: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self { engine: "auto".into(), url: String::new(), model: String::new(), record: String::new() }
+    }
 }
 
 /// Skills other coding agents installed on this computer (Claude Code,
@@ -140,6 +163,7 @@ pub struct KeyConfig {
     pub clear_screen: Keys,
     pub toggle_reasoning: Keys,
     pub copy_reply: Keys,
+    pub voice: Keys,
     pub show_keys: Keys,
     pub quit: Keys,
 }
@@ -187,11 +211,13 @@ impl Default for AppConfig {
             width: 0,
             show_reasoning: false,
             show_stats: true,
-            mouse: true,
+            // Off, so the terminal can select and copy text as usual.
+            mouse: false,
             animations: true,
             images: ImageConfig::default(),
             search: SearchConfig::default(),
             skills: SkillsConfig::default(),
+            voice: VoiceConfig::default(),
             keys: KeyConfig::default(),
         }
     }
@@ -229,6 +255,7 @@ impl Default for KeyConfig {
             clear_screen: Keys::one("ctrl+l"),
             toggle_reasoning: Keys::one("ctrl+o"),
             copy_reply: Keys::one("ctrl+y"),
+            voice: Keys::one("ctrl+t"),
             show_keys: Keys::one("?"),
             quit: Keys::one("ctrl+c"),
         }
