@@ -1,5 +1,6 @@
 //! The full-screen chat: `aihat` with no arguments.
 
+mod about;
 mod app;
 mod composer;
 mod dialogs;
@@ -7,6 +8,7 @@ mod draw;
 mod files;
 mod images;
 mod keys;
+mod market;
 mod providers;
 mod tasks;
 mod transcript;
@@ -34,6 +36,7 @@ pub use tasks::test_endpoint;
 
 pub fn run(db: Database, paths: Paths, config: AppConfig, secrets: Secrets, initial_chat: Option<String>) -> Result<()> {
     let problems = keys::init(&config.keys);
+    crate::ui::picture::settle(&config.images.preview);
     let mut app = app::App::new(db, paths, config, secrets, initial_chat)?;
     if let Some(problem) = problems.first() {
         app.notify(crate::ui::theme::Role::Warn, problem.clone());
@@ -64,12 +67,12 @@ fn setup(enhanced: bool) -> Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Mouse capture stays off so the terminal's own text selection works.
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        SetTitle(format!("aihat — {}", crate::ui::text::current_dir_label()))
-    )?;
+    // The window's title is kept to put back at the end.
+    {
+        use std::io::Write;
+        let _ = write!(stdout, "\x1b[22;0t");
+    }
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, SetTitle(window_title()))?;
     if enhanced {
         // Lets the terminal report shift+enter separately from enter.
         let _ = execute!(
@@ -97,11 +100,33 @@ fn restore(enhanced: bool) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
+    {
+        use std::io::Write;
+        let _ = write!(stdout, "\x1b[23;0t");
+        let _ = stdout.flush();
+    }
     let _ = terminal::disable_raw_mode();
 }
 
-/// Hand the terminal to $VISUAL or $EDITOR for settings.json, then come back.
-fn edit_settings(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App, enhanced: bool) -> Result<()> {
+/// "aihat — ~/projects/fabric-mod · 112×34", as the design's title bar.
+fn window_title() -> String {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    format!("aihat — {} · {cols}×{rows}", crate::ui::text::current_dir_label())
+}
+
+/// Draw every cell again on the next frame: wipe the screen and draw an
+/// empty frame first. (Terminal::clear would ask the terminal where its
+/// cursor is, and stop the app if no answer came.)
+fn repaint(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    use ratatui::backend::Backend;
+    terminal.backend_mut().clear_region(ratatui::backend::ClearType::All)?;
+    terminal.draw(|_| {})?;
+    Ok(())
+}
+
+/// Hand the terminal to $VISUAL or $EDITOR for a file, then come back.
+/// Returns the editor's name when it could not start.
+fn run_editor(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, enhanced: bool, file: &std::path::Path) -> Result<std::result::Result<(), String>> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "nano".into() });
@@ -109,12 +134,38 @@ fn edit_settings(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mu
     let program = parts.next().unwrap_or("nano").to_string();
     let args: Vec<String> = parts.map(str::to_owned).collect();
     restore(enhanced);
-    let status = std::process::Command::new(&program).args(&args).arg(&app.paths.config_file).status();
+    let status = std::process::Command::new(&program).args(&args).arg(file).status();
     setup(enhanced)?;
-    terminal.clear()?;
-    match status {
-        Ok(_) => app.reload_settings(),
-        Err(error) => app.fail(format!("Could not open {program}: {error} · set EDITOR, or edit {}", crate::ui::text::home_relative(&app.paths.config_file))),
+    repaint(terminal)?;
+    Ok(status.map(|_| ()).map_err(|error| format!("Could not open {program}: {error} · set EDITOR")))
+}
+
+fn edit_settings(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App, enhanced: bool) -> Result<()> {
+    match run_editor(terminal, enhanced, &app.paths.config_file.clone())? {
+        Ok(()) => app.reload_settings(),
+        Err(error) => app.fail(format!("{error}, or edit {}", crate::ui::text::home_relative(&app.paths.config_file))),
+    }
+    Ok(())
+}
+
+/// Edit a system prompt's text in the editor; saved when it changed.
+fn edit_prompt(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App, enhanced: bool, id: &str) -> Result<()> {
+    let Some(prompt) = app.db.prompts().unwrap_or_default().into_iter().find(|p| p.id == id) else {
+        return Ok(());
+    };
+    let file = std::env::temp_dir().join(format!("aihat-prompt-{}.md", id.chars().take(8).collect::<String>()));
+    std::fs::write(&file, &prompt.body)?;
+    let edited = run_editor(terminal, enhanced, &file)?;
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let _ = std::fs::remove_file(&file);
+    match edited {
+        Err(error) => app.fail(error),
+        Ok(()) if text.trim().is_empty() => app.fail(format!("{} was left as it was: the text was empty", prompt.name)),
+        Ok(()) if text.trim() == prompt.body.trim() => app.notify(crate::ui::theme::Role::Dim, format!("{} is unchanged", prompt.name)),
+        Ok(()) => match app.db.set_prompt_body(id, text.trim()) {
+            Ok(()) => app.ok(format!("Saved {}", prompt.name)),
+            Err(error) => app.fail(error.to_string()),
+        },
     }
     Ok(())
 }
@@ -133,6 +184,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
             terminal.draw(|frame| view::draw(app, frame))?;
             last_draw = Instant::now();
             dirty = false;
+            // Asking the terminal about pictures may have left marks.
+            if crate::ui::picture::take_asked() {
+                repaint(terminal)?;
+                dirty = true;
+            }
         }
         if app.quit {
             return Ok(());
@@ -140,6 +196,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
         if app.edit_settings {
             app.edit_settings = false;
             edit_settings(terminal, app, enhanced)?;
+            dirty = true;
+            continue;
+        }
+        if let Some(id) = app.edit_prompt.take() {
+            edit_prompt(terminal, app, enhanced, &id)?;
             dirty = true;
             continue;
         }
@@ -162,6 +223,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
                     Event::Resize(..) => {
                         app.cache.clear();
                         terminal.autoresize()?;
+                        let _ = execute!(io::stdout(), SetTitle(window_title()));
                         changed = true;
                     }
                     _ => {}
@@ -176,5 +238,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
             app.on_worker(message);
             dirty = true;
         }
+        // A marketplace search starts once typing pauses.
+        dirty |= market::tick(app);
     }
 }

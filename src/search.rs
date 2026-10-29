@@ -87,12 +87,7 @@ pub fn search_with_metrics(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty());
             if provider_supports_google_grounding(&provider) {
-                grounded_response_results(
-                    api::search_google_grounded(&provider, secrets, query, count).context(
-                        "FreeLLMAPI Google Search needs an available Gemini 2.5 Flash model",
-                    )?,
-                    query,
-                )?
+                grounded_search(db, &provider, secrets, query, count, model)?
             } else {
                 api::search_provider(&provider, secrets, query, count, model)?
             }
@@ -154,10 +149,104 @@ fn provider_supports_google_grounding(provider: &crate::models::Provider) -> boo
             .contains("freellmapi")
 }
 
-fn grounded_response_results(response: Value, query: &str) -> Result<Value> {
+/// Gemini models the provider lists, newest Flash first: those are the
+/// models that can use Google Search grounding.
+fn gemini_models(db: &Database, provider_id: &str) -> Vec<String> {
+    let saved = db.models(Some(provider_id)).unwrap_or_default().into_iter().filter(|m| m.enabled && m.is_chat()).map(|m| m.id);
+    rank_gemini(saved)
+}
+
+/// The Gemini models among `ids`, newest Flash first.
+fn rank_gemini(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let version = |id: &str| -> f64 {
+        id.trim_start_matches("gemini-")
+            .split('-')
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let mut models: Vec<String> = ids
+        .into_iter()
+        .filter(|id| {
+            let id = id.to_lowercase();
+            id.contains("gemini")
+                && !["image", "tts", "audio", "live", "embedding", "robotics", "vision"].iter().any(|skip| id.contains(skip))
+        })
+        .collect();
+    // Newest version first; at the same version full Flash before Lite, and
+    // released models before previews.
+    let rank = |id: &str| {
+        let id = id.to_lowercase();
+        let tier = if id.contains("pro") { 1 } else if id.contains("lite") { 2 } else { 3 };
+        (version(&id), tier, !id.contains("preview"))
+    };
+    models.sort_by(|a, b| rank(b).partial_cmp(&rank(a)).unwrap_or(std::cmp::Ordering::Equal));
+    models
+}
+
+/// Search with FreeLLMAPI's Google Search grounding. FreeLLMAPI moves a
+/// request to another provider when a model is retired or out of quota, and
+/// a model that isn't Gemini can't search, so each answer is checked and the
+/// next Gemini model is tried.
+fn grounded_search(
+    db: &Database,
+    provider: &crate::models::Provider,
+    secrets: &Secrets,
+    query: &str,
+    count: usize,
+    preferred: Option<&str>,
+) -> Result<Value> {
+    let mut candidates: Vec<String> = preferred.filter(|m| m.to_lowercase().contains("gemini")).map(str::to_owned).into_iter().collect();
+    // FreeLLMAPI lists only the models it can run right now (with a key and
+    // quota left); the saved list stands in when it can't be asked.
+    let live = api::list_models(provider, secrets).ok().map(|(rows, _)| {
+        rank_gemini(
+            rows.iter()
+                .filter(|row| !matches!(row.get("execution_status").and_then(Value::as_str), Some("needsKey" | "exhausted" | "disabled")))
+                .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_owned)),
+        )
+    });
+    match live {
+        Some(models) if !models.is_empty() => candidates.extend(models),
+        _ => candidates.extend(gemini_models(db, &provider.id)),
+    }
+    if candidates.is_empty() {
+        candidates.push("gemini-2.5-flash".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|m| seen.insert(m.clone()));
+    let mut problems = Vec::new();
+    for model in candidates.iter().take(4) {
+        let attempt = api::search_google_grounded(provider, secrets, query, count, model)
+            .and_then(|(response, route)| grounded_response_results(response, query, &route));
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(error) => problems.push(format!("{model}: {}", api::api_error(&error).map(|e| e.to_string()).unwrap_or_else(|| format!("{error:#}")))),
+        }
+    }
+    bail!(
+        "{} couldn't search the web: its Google Search works only through a Gemini model, and none answered ({}). Try again in a minute, or use another search engine: aihat config set search.engine brave",
+        provider.name,
+        problems.join("; ")
+    )
+}
+
+/// The results out of a grounded answer. `route` is where FreeLLMAPI says the
+/// request went; an answer from a model that isn't Gemini was not searched.
+fn grounded_response_results(response: Value, query: &str, route: &str) -> Result<Value> {
+    let served = response.get("model").and_then(Value::as_str).unwrap_or("").to_lowercase();
+    let routed = route.to_lowercase();
+    if !served.is_empty() && !served.contains("gemini") && !routed.contains("google") && !routed.contains("gemini") {
+        bail!("the request went to {served}, which can't search");
+    }
     let message = response
         .pointer("/choices/0/message")
         .context("FreeLLMAPI returned no chat completion message")?;
+    // A model without grounding asks for the tool to be run instead of searching.
+    if message.get("tool_calls").and_then(Value::as_array).is_some_and(|calls| !calls.is_empty()) {
+        let by = if served.is_empty() { String::from("the model") } else { served.clone() };
+        bail!("{by} didn't search (Google Search isn't available on it right now)");
+    }
 
     // Preserve citations if a FreeLLMAPI version exposes them as annotations.
     for key in ["results", "citations", "sources"] {
@@ -166,10 +255,15 @@ fn grounded_response_results(response: Value, query: &str) -> Result<Value> {
         }
     }
 
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .context("FreeLLMAPI Google Search returned an empty answer")?;
+    // Content is text, or a list of text parts on some servers.
+    let content = match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts.iter().filter_map(|part| part.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""),
+        _ => String::new(),
+    };
+    if content.trim().is_empty() {
+        bail!("Google Search returned an empty answer");
+    }
     let trimmed = content.trim();
     let candidate = trimmed
         .strip_prefix("```json")
@@ -351,7 +445,7 @@ pub fn tool_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        grounded_response_results, normalize_hits, provider_supports_google_grounding,
+        gemini_models, grounded_response_results, normalize_hits, provider_supports_google_grounding,
         search_with_metrics as run_search, strip_tags,
     };
     use crate::config::{AppConfig, Paths, is_default_local_search_url};
@@ -456,10 +550,41 @@ mod tests {
                 }
             }]
         });
-        let value = grounded_response_results(response, "Rust").unwrap();
+        let value = grounded_response_results(response, "Rust", "").unwrap();
         let hits = normalize_hits(value);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Rust");
         assert_eq!(hits[0].url, "https://www.rust-lang.org/");
+    }
+
+    #[test]
+    fn answers_that_did_not_search_are_refused() {
+        // FreeLLMAPI moved the request to a model that can't search: it asks
+        // for the tool to be run, with no text.
+        let fell_back = json!({"model": "llama-3.3-70b", "choices": [{"message": {"content": null,
+            "tool_calls": [{"id": "1", "type": "function", "function": {"name": "google_search", "arguments": "{}"}}]}}]});
+        let error = grounded_response_results(fell_back, "x", "groq").unwrap_err().to_string();
+        assert!(error.contains("llama-3.3-70b"), "{error}");
+        let empty = json!({"model": "gemini-3.5-flash", "choices": [{"message": {"content": ""}}]});
+        assert!(grounded_response_results(empty, "x", "google").is_err());
+        // Text parts are joined.
+        let parts = json!({"model": "gemini-3.5-flash", "choices": [{"message": {"content": [{"type": "text", "text": "{\"results\":[{\"title\":\"A\",\"url\":\"https://a.example/\"}]}"}]}}]});
+        assert_eq!(normalize_hits(grounded_response_results(parts, "x", "").unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn the_newest_gemini_flash_is_tried_first() {
+        let dir = std::env::temp_dir().join(format!("aihat-gemini-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("aihat.db")).unwrap();
+        let provider = db.insert_provider("FreeLLMAPI", "https://x.example/v1", &json!({}), 60_000).unwrap();
+        for id in ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-robotics-er-2-preview", "llama-3.3-70b"] {
+            db.upsert_model(&provider, id, &json!({})).unwrap();
+        }
+        let order = gemini_models(&db, &provider);
+        assert_eq!(&order[..3], ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]);
+        assert!(!order.iter().any(|id| id.contains("robotics") || id.contains("llama")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

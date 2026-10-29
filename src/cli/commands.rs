@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
-fn terminal_width() -> usize {
+pub(super) fn terminal_width() -> usize {
     crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).saturating_sub(1)
 }
 
@@ -540,6 +540,14 @@ pub enum PromptAction {
         #[arg(short, long)]
         body: Option<String>,
     },
+    /// Describe an assistant; the model writes its system prompt and saves it
+    New {
+        #[arg(required = true, num_args = 1.., value_name = "DESCRIPTION")]
+        description: Vec<String>,
+        /// Also make new chats use it
+        #[arg(long = "use")]
+        use_it: bool,
+    },
     /// New chats use this prompt ("none" to clear)
     Use { name: String },
     /// Delete a prompt
@@ -619,6 +627,24 @@ pub fn prompts(env: &mut Env, action: Option<PromptAction>) -> Result<i32> {
             ok(format!("Saved {name}"));
             Ok(0)
         }
+        PromptAction::New { description, use_it } => {
+            let description = description.join(" ");
+            let (provider, model) = crate::providers::resolve_provider_model(&env.db, None, None)?;
+            eprintln!("{}", dim(&format!("Writing a system prompt with {model}…")));
+            let (name, body) = crate::engine::write_system_prompt(&env.secrets, &provider, &model, &description)?;
+            let id = env.db.add_prompt_tagged(&name, &body, &["generated"])?;
+            println!("{}\n", strong(&name));
+            println!("{body}\n");
+            if use_it {
+                let mut settings = env.db.settings();
+                settings["defaultPromptId"] = json!(id);
+                env.db.set_kv("settings", &settings.to_string())?;
+                ok(format!("Saved {name} · new chats use it"));
+            } else {
+                ok(format!("Saved {name} · use it with: aihat prompts use \"{name}\""));
+            }
+            Ok(0)
+        }
         PromptAction::Use { name } => {
             let mut settings = env.db.settings();
             if matches!(name.to_lowercase().as_str(), "none" | "off") {
@@ -640,7 +666,7 @@ pub fn prompts(env: &mut Env, action: Option<PromptAction>) -> Result<i32> {
             if !env.yes && !prompt::confirm(&format!("Delete the prompt {}?", prompt.name))? {
                 return Ok(0);
             }
-            env.db.conn.execute("DELETE FROM prompts WHERE id=?1", [&prompt.id])?;
+            env.db.delete_prompt(&prompt.id)?;
             ok(format!("Deleted {}", prompt.name));
             Ok(0)
         }
@@ -809,7 +835,7 @@ fn redirected_to() -> Option<String> {
 pub enum McpAction {
     /// List MCP servers
     List,
-    /// Add a server: its URL, or a command after -- (npx, uvx, a program)
+    /// Add a server: its URL, a command after --, or a name from `aihat mcp search`
     Add {
         name: String,
         url: Option<String>,
@@ -819,6 +845,8 @@ pub enum McpAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Find servers to add: hosted ones and the official MCP registry
+    Search { query: Vec<String> },
     /// Sign in with your browser
     Login { name: String },
     /// Sign out (the server stays)
@@ -909,6 +937,57 @@ fn connect_mcp(env: &mut Env, id: &str, name: &str, added: bool) -> Result<i32> 
     }
 }
 
+/// `aihat mcp add deepwiki`: find it in the marketplace, ask for what it
+/// needs, add it and connect (signing in through the browser if it asks).
+fn add_from_market(env: &mut Env, name: &str, token_env: Option<&str>) -> Result<i32> {
+    let t = theme();
+    let wanted = name.to_lowercase();
+    let mut found = crate::market::featured_mcp();
+    if !found.iter().any(|f| f.short_name() == wanted || f.id.eq_ignore_ascii_case(name)) {
+        found = crate::market::find_mcp(name).map_err(|e| Failure::new(EXIT_UNREACHABLE, e.to_string()))?;
+    }
+    let item = found
+        .iter()
+        .find(|f| f.short_name() == wanted || f.id.eq_ignore_ascii_case(name) || f.title.eq_ignore_ascii_case(name))
+        .cloned()
+        .ok_or_else(|| Failure::new(EXIT_USAGE, format!("No MCP server named \"{name}\" in the marketplace")).note("Find one: aihat mcp search, or give its address: aihat mcp add NAME https://…/mcp"))?;
+    let plan = crate::market::plan_mcp(&item);
+    if !plan.supported {
+        return Err(Failure::new(EXIT_ERROR, format!("{} can't be added: {}", item.title, plan.reason)).into());
+    }
+    let mut token = token_env.map(|var| std::env::var(var).unwrap_or_default());
+    if token.is_none()
+        && let Some((what, required)) = &plan.token
+    {
+        if prompt::interactive() {
+            let hint = format!("{what}{}", if *required { "" } else { " · optional, enter skips" });
+            let value = read_secret("Access token", &hint)?;
+            token = Some(value);
+        } else if *required {
+            return Err(Failure::new(EXIT_USAGE, format!("{} needs an access token", item.title)).note(format!("aihat mcp add {} --token-env VAR", item.short_name())).into());
+        }
+    }
+    let mut values = Vec::new();
+    for (var, about) in &plan.env {
+        if let Ok(value) = std::env::var(var) {
+            values.push((var.clone(), value));
+            continue;
+        }
+        if !about.required {
+            continue;
+        }
+        if !prompt::interactive() {
+            return Err(Failure::new(EXIT_USAGE, format!("{} needs {var} ({})", item.title, about.description)).note(format!("Set {var} in your shell, then add it again")).into());
+        }
+        let value = prompt::input(var, &about.description, "", about.secret)?;
+        values.push((var.clone(), value));
+    }
+    let id = crate::market::add_mcp(&env.db, &env.secrets, &item, &plan, token.as_deref(), &values)?;
+    let added_name = env.db.mcp_servers()?.into_iter().find(|s| s.id == id).map(|s| s.name).unwrap_or_else(|| item.short_name());
+    println!("{} {} {}", paint("◇", t.fg(Role::Accent)), strong(&item.title), dim(&format!("· {}", item.connection_label())));
+    connect_mcp(env, &id, &added_name, true)
+}
+
 pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
     let t = theme();
     match action.unwrap_or(McpAction::List) {
@@ -936,6 +1015,37 @@ pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
             }
             Ok(0)
         }
+        McpAction::Search { query } => {
+            let query = query.join(" ");
+            let spinner = super::ask::Spinner::new(std::io::stderr().is_terminal());
+            spinner.set("Looking…");
+            let found = crate::market::find_mcp(&query);
+            spinner.stop();
+            let found = found.map_err(|e| Failure::new(EXIT_UNREACHABLE, e.to_string()))?;
+            if found.is_empty() {
+                println!("Nothing found for \"{query}\".");
+                return Ok(0);
+            }
+            let added: Vec<String> = env.db.mcp_servers()?.into_iter().map(|s| s.url.trim_end_matches('/').to_string()).collect();
+            for item in found.iter().take(30) {
+                let plan = crate::market::plan_mcp(item);
+                let is_added = added.iter().any(|u| *u == plan.target.trim_end_matches('/'));
+                let meta = item.category.clone().unwrap_or_else(|| item.publisher.clone());
+                println!(
+                    "  {}{}{}",
+                    strong(&pad(&text::truncate(&item.short_name(), 20), 22)),
+                    dim(&pad(&format!("{meta} · {}", item.connection_label()), 46)),
+                    if is_added { paint("added", t.fg(Role::Accent)) } else if !plan.supported { dim("can't add") } else { String::new() }
+                );
+                if !item.description.is_empty() {
+                    println!("  {}", dim(&text::truncate(&format!("  {}", item.description.replace('\n', " ")), terminal_width().saturating_sub(4).max(40))));
+                }
+            }
+            println!();
+            println!("{} {}", dim("Add one:"), link(&format!("aihat mcp add {}", found[0].short_name())));
+            Ok(0)
+        }
+        McpAction::Add { name, url: None, token_env, command } if command.is_empty() => add_from_market(env, &name, token_env.as_deref()),
         McpAction::Add { name, url, token_env, command } => {
             let (address, transport) = if !command.is_empty() {
                 (crate::mcp_stdio::command_line(&command), "stdio")
@@ -1025,8 +1135,20 @@ pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
 pub enum SkillAction {
     /// List skills
     List,
-    /// Add a skill: a folder with SKILL.md, or a GitHub link to one
-    Add { source: String },
+    /// Add a skill: a folder with SKILL.md, a GitHub link, or a name from `aihat skills search`
+    Add {
+        source: String,
+        /// Install it for every agent on this computer (~/.agents/skills), not only AI Hat
+        #[arg(long)]
+        global: bool,
+    },
+    /// Find skills to add (popular ones without a query)
+    Search {
+        query: Vec<String>,
+        /// Where to look: popular (claude-plugins.dev) or skills.sh
+        #[arg(long, default_value = "popular")]
+        from: String,
+    },
     /// Read skills again from their folder or GitHub (all, or one)
     Update { name: Option<String> },
     /// Turn a skill on
@@ -1037,6 +1159,27 @@ pub enum SkillAction {
     Show { name: String },
     /// Remove a skill
     Remove { name: String },
+}
+
+/// Turn a skill on or off: AI Hat's own (in the database), or a global one
+/// (remembered in settings.json).
+fn set_skill_on(env: &mut Env, name: &str, on: bool) -> Result<i32> {
+    if let Ok(skill) = find_skill(env, name) {
+        env.db.set_skill_enabled(&skill.id, on)?;
+        ok(format!("{} is {}", skill.name, if on { "on" } else { "off" }));
+        return Ok(0);
+    }
+    let Some(global) = crate::skills::globals().into_iter().find(|g| g.name.eq_ignore_ascii_case(name)) else {
+        return Err(Failure::new(EXIT_ERROR, format!("No skill named \"{name}\"")).note("List them: aihat skills").into());
+    };
+    let off = &mut env.config.skills.off;
+    off.retain(|n| !n.eq_ignore_ascii_case(&global.name));
+    if !on {
+        off.push(global.name.clone());
+    }
+    env.config.save(&env.paths)?;
+    ok(format!("{} is {} {}", global.name, if on { "on" } else { "off" }, dim(&format!("· global skill in {}", global.place))));
+    Ok(0)
 }
 
 fn find_skill(env: &Env, name: &str) -> Result<crate::models::Skill> {
@@ -1052,26 +1195,80 @@ pub fn skills(env: &mut Env, action: Option<SkillAction>) -> Result<i32> {
     match action.unwrap_or(SkillAction::List) {
         SkillAction::List => {
             let skills = env.db.skills()?;
-            if skills.is_empty() {
-                println!("No skills yet. Add one: {}", link("aihat skills add ./my-skill"));
+            let globals: Vec<_> = crate::skills::globals()
+                .into_iter()
+                .filter(|g| !skills.iter().any(|s| s.name.eq_ignore_ascii_case(&g.name)))
+                .collect();
+            if skills.is_empty() && globals.is_empty() {
+                println!("No skills yet. Find some: {} · or add one: {}", link("aihat skills search"), link("aihat skills add ./my-skill"));
                 return Ok(0);
             }
-            for skill in skills {
-                let description = text::truncate(&skill.description.replace('\n', " "), 60);
-                if skill.enabled {
-                    println!("  {} {}{}", paint("✓", t.fg(Role::Accent)), strong(&pad(&skill.name, 18)), dim(&description));
+            let row = |on: bool, name: &str, description: &str, tail: &str| {
+                let description = text::truncate(&description.replace('\n', " "), 60);
+                if on {
+                    println!("  {} {}{}{}", paint("✓", t.fg(Role::Accent)), strong(&pad(name, 18)), dim(&description), dim(tail));
                 } else {
-                    println!("  {}", dim(&format!("○ {}{description}", pad(&skill.name, 18))));
+                    println!("  {}", dim(&format!("○ {}{description}{tail}", pad(name, 18))));
+                }
+            };
+            for skill in &skills {
+                row(skill.enabled, &skill.name, &skill.description, "");
+            }
+            if !globals.is_empty() {
+                if !skills.is_empty() {
+                    println!();
+                }
+                println!("  {}", dim("Global skills · from the agents on this computer"));
+                for g in &globals {
+                    row(!crate::skills::global_is_off(&g.name), &g.name, &g.description, &format!("  {}", g.place));
                 }
             }
             Ok(0)
         }
-        SkillAction::Add { source } => {
+        SkillAction::Search { query, from } => {
+            let query = query.join(" ");
+            let spinner = super::ask::Spinner::new(std::io::stderr().is_terminal());
+            spinner.set("Looking…");
+            let found = match from.as_str() {
+                "skills.sh" | "skillssh" => crate::market::skills_sh(&query),
+                _ => crate::market::popular_skills(&query, 0, 20).map(|(items, _)| items),
+            };
+            spinner.stop();
+            let found = found.map_err(|e| Failure::new(EXIT_UNREACHABLE, e.to_string()))?;
+            if found.is_empty() {
+                println!("Nothing found{}.", if query.is_empty() { String::new() } else { format!(" for \"{query}\"") });
+                return Ok(0);
+            }
+            let installed = env.db.skills()?;
+            for item in &found {
+                let added = crate::market::skill_added(&installed, item);
+                let meta = crate::market::skill_meta(item);
+                println!(
+                    "  {}{}{}",
+                    strong(&pad(&text::truncate(&item.name, 20), 22)),
+                    dim(&pad(&meta, 46)),
+                    if added { paint("added", t.fg(Role::Accent)) } else { String::new() }
+                );
+                if let Some(description) = &item.description {
+                    println!("  {}", dim(&text::truncate(&format!("  {}", description.replace('\n', " ")), terminal_width().saturating_sub(4).max(40))));
+                }
+            }
+            println!();
+            println!("{} {}", dim("Add one:"), link(&format!("aihat skills add {}", crate::market::skill_ref(&found[0]))));
+            Ok(0)
+        }
+        SkillAction::Add { source, global } => {
             let spinner = super::ask::Spinner::new(std::io::stderr().is_terminal() && !std::path::Path::new(&source).exists());
             spinner.set("Reading the skill…");
-            let loaded = crate::skills::load(&source);
+            let loaded = crate::market::load_skill_ref(&source);
             spinner.stop();
-            let (name, description, body, source, files) = loaded.map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+            let loaded = loaded.map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+            if global {
+                let dir = crate::skills::install_global(&loaded).map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+                ok(format!("Added {} for every agent on this computer {}", loaded.0, dim(&format!("· {}", text::home_relative(&dir)))));
+                return Ok(0);
+            }
+            let (name, description, body, source, files) = loaded;
             if env.db.skills()?.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
                 return Err(Failure::new(EXIT_USAGE, format!("There is already a skill named {name}")).note(format!("Update it instead: aihat skills update {name}")).into());
             }
@@ -1109,23 +1306,29 @@ pub fn skills(env: &mut Env, action: Option<SkillAction>) -> Result<i32> {
             }
             Ok(if failed > 0 { EXIT_ERROR } else { 0 })
         }
-        SkillAction::Enable { name } => {
-            let skill = find_skill(env, &name)?;
-            env.db.set_skill_enabled(&skill.id, true)?;
-            ok(format!("{} is on", skill.name));
-            Ok(0)
-        }
-        SkillAction::Disable { name } => {
-            let skill = find_skill(env, &name)?;
-            env.db.set_skill_enabled(&skill.id, false)?;
-            ok(format!("{} is off", skill.name));
-            Ok(0)
-        }
+        SkillAction::Enable { name } => set_skill_on(env, &name, true),
+        SkillAction::Disable { name } => set_skill_on(env, &name, false),
         SkillAction::Show { name } => {
             let skill = match find_skill(env, &name) {
                 Ok(skill) => skill,
-                // Not installed: read it from GitHub without adding it.
                 Err(error) => match crate::skills::parse_github(&name) {
+                    // A global skill, read from its folder.
+                    _ if crate::skills::globals().iter().any(|g| g.name.eq_ignore_ascii_case(&name)) => {
+                        let g = crate::skills::globals().into_iter().find(|g| g.name.eq_ignore_ascii_case(&name)).expect("checked");
+                        crate::models::Skill {
+                            id: String::new(),
+                            name: g.name,
+                            description: g.description,
+                            version: String::new(),
+                            source: text::home_relative(&g.dir),
+                            body: g.body,
+                            mode: "auto".into(),
+                            enabled: true,
+                            can_run_scripts: false,
+                            auto_update: false,
+                        }
+                    }
+                    // Not installed: read it from GitHub without adding it.
                     Some(found) if name.contains('/') => {
                         let (skill_name, description, body, source, _) = crate::skills::fetch_github(&found, false)?;
                         crate::models::Skill {

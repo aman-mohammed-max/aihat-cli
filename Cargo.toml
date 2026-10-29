@@ -44,6 +44,7 @@ arboard = { version = "3.7", default-features = false, features = ["wayland-data
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 sha2 = "0.10"
+flate2 = "1"
 webbrowser = "1"
 
 

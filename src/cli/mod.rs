@@ -45,6 +45,9 @@ struct Cli {
     /// Web search on
     #[arg(short = 'w', long, global = true)]
     web: bool,
+    /// How much the model thinks: off, low, medium or high
+    #[arg(short = 'e', long, global = true, value_name = "LEVEL", value_parser = ["off", "low", "medium", "high"])]
+    effort: Option<String>,
     /// Continue the last chat
     #[arg(short = 'c', long = "continue", global = true)]
     continue_chat: bool,
@@ -84,7 +87,7 @@ enum Top {
     Providers(Sub<commands::ProviderAction>),
     /// List models · set the default model
     Models(Sub<commands::ModelAction>),
-    /// List, show and add system prompts
+    /// List, show, add system prompts, or write one with AI
     Prompts(Sub<commands::PromptAction>),
     /// List, show, continue, export past chats
     Chats(Sub<commands::ChatAction>),
@@ -100,6 +103,15 @@ enum Top {
     Backup(Sub<commands::BackupAction>),
     /// Save a Brave or Tavily search key
     SearchKey(Sub<commands::SearchKeyAction>),
+    /// Who made AI Hat, and where to find it
+    About,
+    /// Show a picture here, to see which way of drawing looks best
+    Preview {
+        file: PathBuf,
+        /// auto, kitty, sixel, iterm2, blocks or halfblocks
+        #[arg(long = "as", value_name = "WAY")]
+        way: Option<String>,
+    },
     /// Draw a picture
     Image {
         prompt: Vec<String>,
@@ -253,6 +265,7 @@ fn run() -> Result<i32> {
         }
     };
     init_theme(args.no_color, args.ascii || config.ascii, Some(&config.accent), &config.colors);
+    crate::skills::set_global_policy(config.skills.use_global, &config.skills.off);
     if args.version {
         println!("aihat {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
@@ -289,6 +302,21 @@ fn run() -> Result<i32> {
         Some(Top::Memory(sub)) => commands::memory(&mut env, sub.action),
         Some(Top::Backup(sub)) => commands::backup(&mut env, sub.action),
         Some(Top::SearchKey(sub)) => commands::search_key(&mut env, sub.action),
+        Some(Top::About) => {
+            print_about();
+            Ok(0)
+        }
+        Some(Top::Preview { file, way }) => {
+            use crate::ui::picture;
+            let shown = picture::Picture::open(&file).map_err(|e| Failure::new(EXIT_ERROR, format!("Can't show {}: {e:#}", file.display())))?;
+            let how = picture::preview(way.as_deref().unwrap_or(&env.config.images.preview));
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            println!("{} {}", shown.describe(), paint(&format!("· drawn with {}", how.label()), theme().fg(Role::Dim)));
+            if !picture::print_with(how, &shown, 0, cols.saturating_sub(1), rows.saturating_sub(3)) {
+                println!("This terminal shows no colour, so there is no preview.");
+            }
+            Ok(0)
+        }
         Some(Top::Image { prompt, count, output }) => commands::image(&mut env, &prompt.join(" "), provider.as_deref(), args.model.as_deref(), count, output.as_deref()),
         None => {
             let prompt = args.prompt.join(" ");
@@ -311,6 +339,7 @@ fn run() -> Result<i32> {
                     model: args.model,
                     system: args.system,
                     web: args.web,
+                    effort: args.effort,
                     json: args.json,
                     stream: !args.no_stream,
                     continue_chat: args.continue_chat,
@@ -378,25 +407,27 @@ fn print_help() {
     let commands = [
         ("providers", "list, add, test, set-default, set-key, remove endpoints", ""),
         ("models", "list models · set the default model", ""),
-        ("prompts", "list, show and add system prompts", ""),
+        ("prompts", "list, show, add system prompts · write one with AI", ""),
         ("chats", "list, show, continue, export past chats", ""),
-        ("mcp", "list, add, remove, sign in to MCP servers", ""),
-        ("skills", "list, enable, disable skills", ""),
+        ("mcp", "list, add, search, sign in to MCP servers", ""),
+        ("skills", "list, add, search, enable, disable skills", ""),
         ("config", "get and set options ", &*format!("({config})")),
         ("backup", "export or restore everything ", "(same data as the phone app)"),
         ("image", "draw a picture with your image model", ""),
+        ("about", "who made AI Hat · links", ""),
     ];
     for (name, what, note) in commands {
         line(format!("  {}{what}{}", cmd(&pad(name, 12)), dim(note)));
     }
     line(String::new());
     line(strong("Options for one prompt"));
-    let options: [(&str, &str, &str, String); 9] = [
+    let options: [(&str, &str, &str, String); 10] = [
         ("-m, --model", "<id>", "model to use ", format!("(default: {model})")),
         ("-P, --provider", "<name>", "provider to use ", format!("(default: {provider})")),
         ("-s, --system", "<name>", "saved system prompt to use", String::new()),
         ("-f, --file", "<path>", "attach a file, repeatable ", "· piped stdin is attached too".into()),
         ("-w, --web", "", "web search on", String::new()),
+        ("-e, --effort", "<level>", "how much the model thinks ", "· off, low, medium, high".into()),
         ("-c, --continue", "", "continue the last chat", String::new()),
         ("-t, --tool", "<server>", "turn on an MCP server, repeatable", String::new()),
         ("    --json", "", "print JSON: reply, usage, sources", String::new()),
@@ -411,6 +442,36 @@ fn print_help() {
     line(format!("  {}   {}   {}", flag("-y, --yes"), flag("-h, --help"), flag("-v, --version")));
     line(String::new());
     line(format!("{} aihat <command> --help {}", dim("Run"), dim("for a command's own options.")));
+    print!("{out}");
+}
+
+/// `aihat about`: the About screen, as text.
+fn print_about() {
+    use crate::about::{self, APP_LINKS, BIO, MAKER, MAKER_LINKS, ROLE};
+    let t = theme();
+    let logo = ["  ▗▄▄▄▄▖  ", " ▟██████▙ ", " ▜██████▛ ", "   ▀▀▀▀   "];
+    let beside = [paint("AI Hat", t.bold(Role::Strong)), paint(&about::version_line(), t.fg(Role::Dim)), paint("Chat with any model, on your terms", t.fg(Role::Dim)), String::new()];
+    let mut out = String::new();
+    for (mark, text) in logo.iter().zip(beside) {
+        out.push_str(&format!("{}  {text}\n", paint(mark, t.fg(Role::Accent))));
+    }
+    out.push('\n');
+    out.push_str(&format!("{}\n", paint("MADE BY", t.fg(Role::Dim))));
+    out.push_str(&format!("{} {}\n", paint(MAKER, t.bold(Role::Strong)), paint(&format!("· {ROLE}"), t.fg(Role::Dim))));
+    let width = commands::terminal_width().clamp(40, 80);
+    for row in crate::ui::markdown::wrap_segments(&[(BIO.to_string(), t.fg(Role::Text))], width) {
+        out.push_str(&crate::ui::ansi::line(&Line::from(row)));
+        out.push('\n');
+    }
+    out.push('\n');
+    for link in &MAKER_LINKS {
+        out.push_str(&format!("{}{}\n", paint(&crate::ui::text::pad(link.label, 22), t.fg(Role::Text)), paint(link.url, t.fg(Role::Link))));
+    }
+    out.push('\n');
+    out.push_str(&format!("{}\n", paint("ABOUT THE APP", t.fg(Role::Dim))));
+    for link in &APP_LINKS {
+        out.push_str(&format!("{}{}\n", paint(&crate::ui::text::pad(link.label, 22), t.fg(Role::Text)), paint(link.url, t.fg(Role::Link))));
+    }
     print!("{out}");
 }
 

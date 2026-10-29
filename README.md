@@ -157,12 +157,14 @@ Already use the AI Hat app on this computer? Your providers, prompts and chats a
 
 ## What it can do
 
-- **💬 Any model, one place.** Switch models with **Ctrl+P**, system prompts with **Ctrl+S**, and pick up old chats with **Ctrl+R**.
+- **💬 Any model, one place.** Switch models with **Ctrl+P**, system prompts with **Ctrl+S**, and pick up old chats with **Ctrl+R**. `/effort high` lets reasoning models think longer.
 - **🌐 Searches the web** and shows its sources: type `/search` or turn it on in `/tools`.
 - **📎 Reads your files.** Type `@` to attach a file or a web page; pictures too, for models that can see.
-- **🎨 Draws pictures.** `/image a lighthouse in a storm` shows a preview right in the terminal, then asks where to save it.
+- **🎨 Draws pictures.** `/image a lighthouse in a storm` shows the picture right in the terminal (the real picture in terminals that can show one, a detailed block drawing in the rest), then asks where to save it. Press **v** to see it full screen.
+- **🛍️ Marketplace.** `/market` finds skills (popular ones, skills.sh, GitHub, and websites like Vercel and Stripe that publish their own) and MCP servers (the official MCP registry), and adds them in one key.
 - **🔌 Connects to tools (MCP).** Add GitHub, Linear, Notion, a database and more. Sign-in happens in your browser, automatically.
-- **🧩 Learns skills.** Add a skill from a folder or a GitHub link: `aihat skills add https://github.com/anthropics/skills/tree/main/skills/xlsx`
+- **🧩 Learns skills.** Add a skill from the marketplace, a folder or a GitHub link. Skills you installed for Claude Code, Codex or other coding agents (`~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills`) work here too, and **Ctrl+G** in `/market` installs a skill for all of them at once.
+- **✍️ Writes system prompts for you.** `/prompt a patient Rust tutor` and the model writes one, saves it and uses it in the chat.
 - **🧠 Remembers you.** Your name, projects and preferences carry across chats. See and edit them with `/memory`.
 - **⌨️ Works your way.** Every shortcut, colour and option is in one file: `aihat config edit`.
 - **🔒 Private by default.** Chats stay on your computer. API keys go to your system keychain (or a private file only you can read on Linux and BSD). Nothing leaves your computer except what goes to the models, search and tools you set up.
@@ -192,7 +194,9 @@ Already use the AI Hat app on this computer? Your providers, prompts and chats a
 
 **Colours look wrong** — your terminal may not tell AI Hat it supports full colour. Run `aihat config set colors truecolor`. For the intended look, use the JetBrains Mono font.
 
-**Something else?** [Open an issue](https://github.com/aman-mohammed-max/aihat-cli/issues) and say what you typed and what happened.
+**Pictures look blocky** — your terminal can't show real pictures, so AI Hat draws them with blocks. See which way looks best with `aihat preview picture.png --as sixel` (or `iterm2`, `kitty`, `blocks`, `halfblocks`), then keep it: `aihat config set images.preview sixel`.
+
+**Something else?** [Open an issue](https://github.com/aman-mohammed-max/aihat-cli/issues) and say what you typed and what happened. `/about` (or `aihat about`) has every link.
 
 The [full guide](docs/GUIDE.md) covers every command, setting and feature.
 
@@ -207,6 +211,10 @@ cargo build --release      # the program is target/release/aihat
 ```
 
 Every push is built and packaged for every platform by [the build workflow](.github/workflows/release.yml); pushing a version tag such as `v0.1.0` publishes a release with all the files above and their SHA-256 checksums.
+
+## Made by
+
+[Aman Mohammed](https://amanm.space) · [GitHub](https://github.com/aman-mohammed-max) · [say hi](https://connect.amanm.space). AI Hat is also [an app for phones](https://github.com/aman-mohammed-max/aihat) that shares its chats and settings with this one.
 
 ## License
 

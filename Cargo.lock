@@ -29,6 +29,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "dirs",
+ "flate2",
  "ignore",
  "image",
  "keyring",

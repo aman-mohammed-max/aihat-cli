@@ -26,6 +26,8 @@ pub enum Dialog {
     Text(TextView),
     Image(Box<super::images::ImageViewer>),
     Memory(MemoryDialog),
+    About(super::about::AboutDialog),
+    Effort(EffortPicker),
 }
 
 // ------------------------------------------------------------------ shared
@@ -331,6 +333,9 @@ pub fn model_caps_long(model: &Model) -> String {
 
 // ------------------------------------------------------------------ prompts
 
+/// The prompt list's last row: write a new prompt with AI.
+const WRITE_NEW: &str = "new:ai";
+
 pub struct PromptPicker {
     query: String,
     selected: Option<usize>,
@@ -393,6 +398,17 @@ impl PromptPicker {
                 true,
             ));
         }
+        if score(&self.query, "new write ai").is_some() || self.query.is_empty() {
+            rows.push(PickRow::Item(
+                Line::from(vec![
+                    Span::styled("+ ", t.fg(Role::Accent)),
+                    Span::styled("Write a new one with AI", t.fg(Role::Link)),
+                    Span::styled("  describe it, the model writes it", t.fg(Role::Dim)),
+                ]),
+                Some(WRITE_NEW.to_string()),
+                true,
+            ));
+        }
         rows
     }
 
@@ -416,7 +432,7 @@ impl PromptPicker {
         query_row(buf, inner, inner.y, &self.query, &text::plural(count, "prompt", "prompts"));
         draw_rows(buf, inner, inner.y + 2, &rows, self.selected, inner.height.saturating_sub(4) as usize);
         let scope = if self.make_default { "tab default / this chat" } else { "tab this chat / default" };
-        put(buf, inner.x, inner.bottom() - 1, &format!("↑↓ move · enter pick · {scope}"), t.fg(Role::Dim), inner.right());
+        put(buf, inner.x, inner.bottom() - 1, &format!("↑↓ move · enter pick · {scope} · ctrl+e edit"), t.fg(Role::Dim), inner.right());
     }
 
     fn key(&mut self, app: &mut App, key: KeyEvent) -> bool {
@@ -428,7 +444,19 @@ impl PromptPicker {
             KeyCode::Tab | KeyCode::BackTab => self.make_default = !self.make_default,
             KeyCode::Enter => {
                 if let Some(PickRow::Item(_, id, _)) = self.selected.and_then(|i| rows.get(i)) {
+                    if id.as_deref() == Some(WRITE_NEW) {
+                        app.dialog = Some(Dialog::Form(Form::write_prompt()));
+                        return false;
+                    }
                     app.apply_prompt(id.clone(), self.make_default);
+                    return false;
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(PickRow::Item(_, Some(id), _)) = self.selected.and_then(|i| rows.get(i))
+                    && id != WRITE_NEW
+                {
+                    app.edit_prompt = Some(id.clone());
                     return false;
                 }
             }
@@ -437,6 +465,93 @@ impl PromptPicker {
                     self.selected = first_item(&self.rows(app));
                 }
             }
+        }
+        true
+    }
+}
+
+// ------------------------------------------------------------------ effort
+
+/// How much the model thinks before answering, as `/effort` in the app:
+/// sent as `reasoning_effort`; models without reasoning ignore it.
+pub const EFFORTS: [(&str, &str); 4] = [
+    ("off", "let the model decide"),
+    ("low", "quick answers"),
+    ("medium", "thinks it through"),
+    ("high", "thinks longest, for hard problems"),
+];
+
+pub struct EffortPicker {
+    selected: Option<usize>,
+}
+
+impl EffortPicker {
+    pub fn new(app: &App) -> Self {
+        let current = app.current_effort();
+        Self { selected: Some(EFFORTS.iter().position(|(level, _)| *level == current).unwrap_or(0)) }
+    }
+
+    fn rows(&self, app: &App) -> Vec<PickRow<&'static str>> {
+        let t = theme();
+        let current = app.current_effort();
+        EFFORTS
+            .iter()
+            .map(|(level, about)| {
+                let mut label = level.to_string();
+                label[..1].make_ascii_uppercase();
+                PickRow::Item(
+                    Line::from(vec![
+                        Span::styled(if *level == current { "● " } else { "  " }, t.fg(Role::Accent)),
+                        Span::styled(text::pad(&label, 10), t.fg(Role::Text)),
+                        Span::styled(*about, t.fg(Role::Dim)),
+                    ]),
+                    *level,
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    fn draw(&self, app: &App, buf: &mut Buffer, screen: Rect) {
+        let t = theme();
+        let rows: Vec<_> = self
+            .rows(app)
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| match row {
+                PickRow::Item(line, key, ok) => PickRow::Item(emphasise(line, Some(index) == self.selected), key, ok),
+                header => header,
+            })
+            .collect();
+        let area = draw::dialog_rect(screen, 64, rows.len() as u16 + 6, 5);
+        let scope = if app.chat.is_some() { "this chat" } else { "new chats" };
+        draw::boxed(buf, area, t.fg(Role::Accent), "Reasoning effort", scope);
+        let inner = draw::inner(area);
+        put(buf, inner.x, inner.y, "How much the model thinks before it answers.", t.fg(Role::Dim), inner.right());
+        draw_rows(buf, inner, inner.y + 2, &rows, self.selected, rows.len());
+        put(buf, inner.x, inner.bottom() - 1, "↑↓ move · enter pick · esc close", t.fg(Role::Dim), inner.right());
+    }
+
+    fn key(&mut self, app: &mut App, key: KeyEvent) -> bool {
+        let rows = self.rows(app);
+        match key.code {
+            KeyCode::Esc => return false,
+            KeyCode::Up => self.selected = move_selection(&rows, self.selected, false),
+            KeyCode::Down | KeyCode::Tab => self.selected = move_selection(&rows, self.selected, true),
+            KeyCode::Enter => {
+                if let Some(PickRow::Item(_, level, _)) = self.selected.and_then(|i| rows.get(i)) {
+                    app.set_effort(level);
+                    return false;
+                }
+            }
+            // The first letter picks one: o, l, m, h.
+            KeyCode::Char(c) => {
+                if let Some((level, _)) = EFFORTS.iter().find(|(level, _)| level.starts_with(c.to_ascii_lowercase())) {
+                    app.set_effort(level);
+                    return false;
+                }
+            }
+            _ => {}
         }
         true
     }
@@ -930,7 +1045,7 @@ fn toggle_tool(app: &mut App, row: ToolRow) {
 pub fn skill_mode_label(mode: &str) -> &'static str {
     match mode {
         "always" => "always on",
-        "manual" | "command" => "when I ask",
+        "onAsk" | "manual" | "command" => "when I ask",
         _ => "automatic",
     }
 }
@@ -1097,32 +1212,50 @@ pub fn refresh_mcp(app: &mut App, id: String, name: String) {
     });
 }
 
+/// A row of /skills: one of AI Hat's own skills, or a global one that
+/// another agent installed on this computer.
+enum SkillRow {
+    Library(crate::models::Skill),
+    Global(crate::skills::Global),
+}
+
+fn skill_rows(app: &App) -> Vec<SkillRow> {
+    let library = app.db.skills().unwrap_or_default();
+    let globals: Vec<_> = crate::skills::globals()
+        .into_iter()
+        .filter(|g| !library.iter().any(|s| s.name.eq_ignore_ascii_case(&g.name)))
+        .collect();
+    library
+        .into_iter()
+        .map(SkillRow::Library)
+        .chain(globals.into_iter().map(SkillRow::Global))
+        .collect()
+}
+
 fn draw_skills(dialog: &ListDialog, app: &App, buf: &mut Buffer, screen: Rect) {
     let t = theme();
-    let skills = app.db.skills().unwrap_or_default();
-    let visible = skills.len().clamp(1, 14);
+    let rows = skill_rows(app);
+    let visible = rows.len().clamp(1, 14);
     let area = draw::dialog_rect(screen, 84, visible as u16 + 4, 5);
     draw::boxed(buf, area, t.fg(Role::Accent), "Skills", "esc close");
     let inner = draw::inner(area);
-    if skills.is_empty() {
-        put(buf, inner.x, inner.y, "No skills yet · press a to add a folder with a SKILL.md", t.fg(Role::Dim), inner.right());
+    if rows.is_empty() {
+        put(buf, inner.x, inner.y, "No skills yet · a adds a folder or a GitHub link · /market finds more", t.fg(Role::Dim), inner.right());
     }
-    let first = window(dialog.selected, skills.len(), visible);
-    for (offset, skill) in skills.iter().skip(first).take(visible).enumerate() {
+    let first = window(dialog.selected, rows.len(), visible);
+    for (offset, row) in rows.iter().skip(first).take(visible).enumerate() {
         let selected = first + offset == dialog.selected;
-        let (mark, name_role, desc_role) = if skill.enabled {
-            ("✓ ", Role::Strong, Role::Dim)
-        } else {
-            ("○ ", Role::Dim, Role::Dim)
+        let (name, description, on, right) = match row {
+            SkillRow::Library(skill) => (skill.name.clone(), skill.description.clone(), skill.enabled, skill_mode_label(&skill.mode).to_string()),
+            SkillRow::Global(g) => (g.name.clone(), g.description.clone(), !crate::skills::global_is_off(&g.name), "global".to_string()),
         };
-        let description = skill.description.replace('\n', " ");
-        let mode = skill_mode_label(&skill.mode);
+        let (mark, name_role) = if on { ("✓ ", Role::Strong) } else { ("○ ", Role::Dim) };
         let room = (inner.width as usize).saturating_sub(2 + 18 + 12);
         let line = Line::from(vec![
-            Span::styled(mark, if skill.enabled { t.fg(Role::Accent) } else { t.fg(Role::Dim) }),
-            Span::styled(text::pad(&skill.name, 18), t.fg(name_role)),
-            Span::styled(text::pad(&description, room), t.fg(desc_role)),
-            Span::styled(text::pad_left(mode, 12), t.fg(Role::Dim)),
+            Span::styled(mark, if on { t.fg(Role::Accent) } else { t.fg(Role::Dim) }),
+            Span::styled(text::pad(&name, 18), t.fg(name_role)),
+            Span::styled(text::pad(&description.replace('\n', " "), room), t.fg(Role::Dim)),
+            Span::styled(text::pad_left(&right, 12), t.fg(Role::Dim)),
         ]);
         draw::row(buf, inner, inner.y + offset as u16, line, selected);
     }
@@ -1136,13 +1269,69 @@ fn draw_skills(dialog: &ListDialog, app: &App, buf: &mut Buffer, screen: Rect) {
     );
 }
 
+/// Turn a global skill on or off: kept in settings.json, used from the next message.
+fn toggle_global_skill(app: &mut App, name: &str) {
+    let off = &mut app.config.skills.off;
+    let was_off = off.iter().any(|n| n.eq_ignore_ascii_case(name));
+    if was_off {
+        off.retain(|n| !n.eq_ignore_ascii_case(name));
+    } else {
+        off.push(name.to_string());
+    }
+    crate::skills::set_global_policy(app.config.skills.use_global, &app.config.skills.off);
+    app.ctx.config = app.config.clone();
+    match app.config.save(&app.paths) {
+        Ok(()) => app.ok(if was_off { format!("{name} is on") } else { format!("{name} is off") }),
+        Err(error) => app.fail(error.to_string()),
+    }
+}
+
 fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
-    let skills = app.db.skills().unwrap_or_default();
-    let selected = skills.get(dialog.selected).cloned();
+    let rows = skill_rows(app);
+    let count = rows.len();
+    let row = rows.into_iter().nth(dialog.selected);
+    let (selected, global) = match row {
+        Some(SkillRow::Library(skill)) => (Some(skill), None),
+        Some(SkillRow::Global(g)) => (None, Some(g)),
+        None => (None, None),
+    };
+    if let Some(g) = global {
+        match key.code {
+            KeyCode::Esc => return false,
+            KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
+            KeyCode::Down => dialog.selected = (dialog.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('a') => {
+                app.dialog = Some(Dialog::Form(Form::add_skill()));
+                return true;
+            }
+            KeyCode::Char(' ') => toggle_global_skill(app, &g.name),
+            KeyCode::Char('m') => app.notify(Role::Dim, format!("{} is a global skill: the assistant opens it when a task matches", g.name)),
+            KeyCode::Char('r') => app.ok(format!("{} is read from its folder every time", g.name)),
+            KeyCode::Char('x') | KeyCode::Delete => app.notify(
+                Role::Dim,
+                format!("{} belongs to the agents on this computer · delete its folder {} to remove it everywhere, or space to turn it off here", g.name, text::home_relative(&g.dir)),
+            ),
+            KeyCode::Enter => {
+                let mut lines = vec![
+                    Line::styled(g.description.clone(), theme().fg(Role::Dim)),
+                    Line::styled(format!("global skill · {}", text::home_relative(&g.dir)), theme().fg(Role::Dim)),
+                    Line::default(),
+                ];
+                lines.extend(crate::ui::markdown::render(
+                    &g.body,
+                    crate::ui::markdown::MdOptions { width: 76, indent: 0, block_indent: 2, wide: 76 },
+                ));
+                app.dialog = Some(Dialog::Text(TextView { title: g.name, lines, scroll: 0, prompt_id: None }));
+                return true;
+            }
+            _ => {}
+        }
+        return true;
+    }
     match key.code {
         KeyCode::Esc => return false,
         KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
-        KeyCode::Down => dialog.selected = (dialog.selected + 1).min(skills.len().saturating_sub(1)),
+        KeyCode::Down => dialog.selected = (dialog.selected + 1).min(count.saturating_sub(1)),
         KeyCode::Char('a') => {
             app.dialog = Some(Dialog::Form(Form::add_skill()));
             return true;
@@ -1157,7 +1346,7 @@ fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
             if let Some(skill) = selected {
                 let next = match skill.mode.as_str() {
                     "auto" => "always",
-                    "always" => "manual",
+                    "always" => "onAsk",
                     _ => "auto",
                 };
                 match app.db.set_skill_mode(&skill.id, next) {
@@ -1207,6 +1396,7 @@ fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
                     title: skill.name,
                     lines,
                     scroll: 0,
+                    prompt_id: None,
                 }));
                 return true;
             }
@@ -1228,6 +1418,10 @@ pub enum FormKind {
     AddMcp,
     McpToken(String),
     AddSkill,
+    /// A server from /market that takes a token or settings first.
+    MarketMcp(Box<crate::market::McpListing>),
+    /// Describe an assistant; the model writes its system prompt.
+    WritePrompt,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1239,7 +1433,7 @@ enum FieldKind {
 
 #[derive(Clone)]
 struct Field {
-    label: &'static str,
+    label: String,
     value: String,
     kind: FieldKind,
     /// Dim text after the value (or instead of it when empty).
@@ -1248,9 +1442,9 @@ struct Field {
 }
 
 impl Field {
-    fn text(label: &'static str, value: impl Into<String>, empty: &str) -> Self {
+    fn text(label: impl Into<String>, value: impl Into<String>, empty: &str) -> Self {
         Self {
-            label,
+            label: label.into(),
             value: value.into(),
             kind: FieldKind::Text,
             hint: String::new(),
@@ -1258,9 +1452,9 @@ impl Field {
         }
     }
 
-    fn secret(label: &'static str, hint: &str, empty: &str) -> Self {
+    fn secret(label: impl Into<String>, hint: &str, empty: &str) -> Self {
         Self {
-            label,
+            label: label.into(),
             value: String::new(),
             kind: FieldKind::Secret,
             hint: hint.into(),
@@ -1270,7 +1464,7 @@ impl Field {
 
     fn choice(label: &'static str, options: Vec<&'static str>, index: usize) -> Self {
         Self {
-            label,
+            label: label.into(),
             value: String::new(),
             kind: FieldKind::Choice(options, index),
             hint: String::new(),
@@ -1421,6 +1615,48 @@ impl Form {
         }
     }
 
+    /// The token and settings a marketplace server asks for, filled from
+    /// the environment where they are already set.
+    pub fn market_mcp(server: crate::market::McpListing, plan: &crate::market::McpPlan) -> Self {
+        let mut fields = Vec::new();
+        if let Some((about, required)) = &plan.token {
+            let empty = if *required { format!("needed · {about}") } else { format!("optional · {about}") };
+            fields.push(Field::secret("Token", crate::secrets::where_keys_go(false), &empty));
+        }
+        for (var, about) in &plan.env {
+            let empty = match (about.required, about.description.is_empty()) {
+                (true, true) => "needed".to_string(),
+                (true, false) => format!("needed · {}", about.description),
+                (false, true) => "optional".to_string(),
+                (false, false) => format!("optional · {}", about.description),
+            };
+            let mut field = if about.secret { Field::secret(var.clone(), crate::secrets::where_keys_go(false), &empty) } else { Field::text(var.clone(), "", &empty) };
+            field.value = std::env::var(var).unwrap_or_default();
+            fields.push(field);
+        }
+        Self {
+            title: format!("Add {}", server.title),
+            kind: FormKind::MarketMcp(Box::new(server)),
+            fields,
+            focus: 0,
+            status: None,
+            testable: false,
+            token: 0,
+        }
+    }
+
+    pub fn write_prompt() -> Self {
+        Self {
+            title: "Write a system prompt with AI".into(),
+            kind: FormKind::WritePrompt,
+            fields: vec![Field::text("Describe it", "", "a patient Rust tutor who explains with small examples")],
+            focus: 0,
+            status: None,
+            testable: false,
+            token: 0,
+        }
+    }
+
     pub fn add_skill() -> Self {
         Self {
             title: "Add a skill".into(),
@@ -1472,12 +1708,12 @@ impl Form {
         let area = draw::dialog_rect(screen, 76, self.rows() + 2, 6);
         draw::boxed(buf, area, t.fg(Role::Accent), &self.title, "");
         let inner = draw::inner(area);
-        let label_width = self.fields.iter().map(|f| width(f.label)).max().unwrap_or(8).max(8) as u16 + 2;
+        let label_width = self.fields.iter().map(|f| width(&f.label)).max().unwrap_or(8).max(8) as u16 + 2;
         let mut y = inner.y;
         for (index, field) in self.fields.iter().enumerate() {
             let focused = index == self.focus;
             let label_style = if focused { t.fg(Role::Accent) } else { t.fg(Role::Dim) };
-            put(buf, inner.x, y, field.label, label_style, inner.right());
+            put(buf, inner.x, y, &field.label, label_style, inner.right());
             let x = inner.x + label_width;
             match &field.kind {
                 FieldKind::Choice(options, chosen) => {
@@ -1773,6 +2009,35 @@ impl Form {
                 app.dialog = Some(Dialog::Mcp(ListDialog::default()));
                 Ok(false)
             }
+            FormKind::MarketMcp(server) => {
+                let plan = crate::market::plan_mcp(&server);
+                let token = self.field("Token");
+                if plan.token.as_ref().is_some_and(|(_, required)| *required) && token.is_empty() {
+                    self.focus = self.fields.iter().position(|f| f.label == "Token").unwrap_or(0);
+                    return Err("Paste the token first".into());
+                }
+                let mut env = Vec::new();
+                for (var, about) in &plan.env {
+                    let value = self.field(var);
+                    if about.required && value.is_empty() {
+                        self.focus = self.fields.iter().position(|f| &f.label == var).unwrap_or(0);
+                        return Err(format!("{var} is needed"));
+                    }
+                    env.push((var.clone(), value));
+                }
+                let id = crate::market::add_mcp(&app.db, &app.secrets, &server, &plan, Some(&token), &env).map_err(|e| e.to_string())?;
+                let name = app.db.mcp_servers().unwrap_or_default().into_iter().find(|s| s.id == id).map(|s| s.name).unwrap_or_else(|| server.short_name());
+                refresh_mcp(app, id, name);
+                Ok(true)
+            }
+            FormKind::WritePrompt => {
+                let description = self.field("Describe it");
+                if description.is_empty() {
+                    return Err("Describe the assistant first, like: a patient Rust tutor".into());
+                }
+                app.write_prompt(&description);
+                Ok(true)
+            }
             FormKind::AddSkill => {
                 let source = self.field("Source");
                 if source.is_empty() {
@@ -1798,7 +2063,7 @@ fn cursor_at(buf: &mut Buffer, x: u16, y: u16) {
 
 /// ` Custom `  OpenRouter  Groq … with the chosen one highlighted, scrolled
 /// so the chosen option is always visible.
-fn draw_choices(buf: &mut Buffer, x: u16, y: u16, right: u16, options: &[&str], chosen: usize) {
+pub(super) fn draw_choices(buf: &mut Buffer, x: u16, y: u16, right: u16, options: &[&str], chosen: usize) {
     let t = theme();
     let room = right.saturating_sub(x) as usize;
     let mut first = 0;
@@ -1947,23 +2212,50 @@ pub struct TextView {
     pub title: String,
     pub lines: Vec<Line<'static>>,
     pub scroll: usize,
+    /// A saved system prompt being shown: e opens it in the editor.
+    pub prompt_id: Option<String>,
 }
 
 impl TextView {
+    /// A system prompt the model just wrote, to read before using it.
+    pub fn written_prompt(id: &str, name: &str, body: &str) -> Self {
+        let t = theme();
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::styled("Saved to your system prompts and set for this chat.", t.fg(Role::Accent)),
+            Line::default(),
+        ];
+        for paragraph in body.lines() {
+            if paragraph.trim().is_empty() {
+                lines.push(Line::default());
+                continue;
+            }
+            for row in crate::ui::markdown::wrap_segments(&[(paragraph.to_string(), t.fg(Role::Text))], 78) {
+                lines.push(Line::from(row));
+            }
+        }
+        Self { title: name.to_string(), lines, scroll: 0, prompt_id: Some(id.to_string()) }
+    }
+
     fn draw(&self, buf: &mut Buffer, screen: Rect) {
         let t = theme();
-        let height = (screen.height.saturating_sub(8)).max(8);
+        // As tall as the text, up to the screen.
+        let height = (self.lines.len() as u16 + 2).clamp(8, screen.height.saturating_sub(8).max(8));
         let area = draw::dialog_rect(screen, 84, height, 3);
-        draw::boxed(buf, area, t.fg(Role::Accent), &self.title, "↑↓ scroll · esc close");
+        let keys = if self.prompt_id.is_some() { "↑↓ scroll · e edit · esc close" } else { "↑↓ scroll · esc close" };
+        draw::boxed(buf, area, t.fg(Role::Accent), &self.title, keys);
         let inner = draw::inner(area);
         for (offset, line) in self.lines.iter().skip(self.scroll).take(inner.height as usize).enumerate() {
             put_line(buf, inner.x, inner.y + offset as u16, line, inner.right());
         }
     }
 
-    fn key(&mut self, key: KeyEvent) -> bool {
+    fn key(&mut self, app: &mut App, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return false,
+            KeyCode::Char('e') if self.prompt_id.is_some() => {
+                app.edit_prompt = self.prompt_id.clone();
+                return false;
+            }
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Down => self.scroll = (self.scroll + 1).min(self.lines.len().saturating_sub(1)),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
@@ -2079,6 +2371,8 @@ pub fn draw(app: &App, buf: &mut Buffer, screen: Rect) {
         Some(Dialog::Text(view)) => view.draw(buf, screen),
         Some(Dialog::Image(viewer)) => viewer.draw(app, buf, screen),
         Some(Dialog::Memory(dialog)) => dialog.draw(app, buf, screen),
+        Some(Dialog::About(dialog)) => dialog.draw(buf, screen),
+        Some(Dialog::Effort(picker)) => picker.draw(app, buf, screen),
         None => {}
     }
 }
@@ -2099,9 +2393,11 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
         Dialog::Skills(list) => skills_key(list, app, key),
         Dialog::Form(form) => form.key(app, key),
         Dialog::Confirm(confirm) => confirm.key(app, key),
-        Dialog::Text(view) => view.key(key),
+        Dialog::Text(view) => view.key(app, key),
         Dialog::Image(viewer) => viewer.key(app, key),
         Dialog::Memory(dialog) => dialog.key(app, key),
+        Dialog::About(dialog) => dialog.key(app, key),
+        Dialog::Effort(picker) => picker.key(app, key),
     };
     if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);

@@ -22,8 +22,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-/// Prose never runs wider than this, even in very wide terminals.
+/// Prose in the design's 112-column window is 90 columns wide; wider
+/// windows keep that share of the width.
 pub const MAX_TEXT_WIDTH: usize = 90;
+
+/// How wide prose runs in a window `width` columns wide.
+pub fn prose_width(width: usize) -> usize {
+    MAX_TEXT_WIDTH.max(width * MAX_TEXT_WIDTH / 112)
+}
 /// Under 100 columns prose wraps sooner, as in the small-terminal design.
 const NARROW_TEXT_WIDTH: usize = 60;
 
@@ -39,7 +45,7 @@ pub struct Layout {
 
 impl Layout {
     fn text_width(&self) -> usize {
-        let max = if self.narrow { NARROW_TEXT_WIDTH } else { MAX_TEXT_WIDTH };
+        let max = if self.narrow { NARROW_TEXT_WIDTH } else { prose_width(self.width) };
         self.width.saturating_sub(1).min(max)
     }
 }
@@ -87,7 +93,7 @@ fn picture_rows(item: &Value, layout: Layout, max_cols: u16, max_rows: u16) -> O
     let (w, h) = image::GenericImageView::dimensions(&picture.image);
     let max_cols = max_cols.min(layout.text_width().saturating_sub(3) as u16);
     let (cols, rows) = picture::fit(w, h, max_cols, max_rows);
-    let lines = picture::blocks(&picture.image, cols, rows)?;
+    let lines = picture::chat_cells(&picture.image, cols, rows)?;
     let indented = lines
         .into_iter()
         .map(|line| {

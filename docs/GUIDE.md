@@ -74,6 +74,23 @@ Servers that need a sign-in get one the way the MCP specification describes it (
 
 Programs added with `--` start the first time they're needed and stop when aihat exits.
 
+## Marketplace
+
+`/market` (or `/market mcp`) finds things to add, as on the phone app. **Tab** switches between skills and MCP servers, **←/→** picks where skills come from, typing searches, **enter** adds the selected one, and the right side shows it in full before you add it:
+
+- **Popular**: the most-installed skills in public GitHub repositories (claude-plugins.dev).
+- **skills.sh**: the open skills directory.
+- **Repo or site**: `owner/repo`, a GitHub link, or a website that publishes skills itself at `/.well-known/agent-skills` (vercel.com, developers.cloudflare.com, docs.stripe.com, supabase.com). Downloads from websites are checked against the checksum the site gives.
+- **MCP servers**: hosted servers that work straight away (DeepWiki, Context7, Microsoft Learn…), then the official MCP registry, including servers that run on this computer (npm, PyPI, Docker). A server that needs a token or settings asks for them first; one with a browser sign-in opens it.
+
+**Ctrl+G** on a skill installs it for every coding agent on the computer (`~/.agents/skills`, linked into `~/.claude/skills` and `~/.codex/skills` when those exist). From the command line:
+
+    aihat skills search pdf                 # popular skills; --from skills.sh
+    aihat skills add anthropics/skills/pdf  # or a GitHub link, a folder, or just a name
+    aihat skills add pdf --global           # for every agent on the computer
+    aihat mcp search notion
+    aihat mcp add notion                    # a name from the search, or NAME URL
+
 ## Skills
 
 A skill is a folder with a `SKILL.md`, from this computer or from GitHub:
@@ -85,34 +102,53 @@ A skill is a folder with a `SKILL.md`, from this computer or from GitHub:
 
 The files next to `SKILL.md` (references, templates, scripts) come along as text so the model can read them; scripts are never run. In `/skills`, `a` adds a folder or a GitHub link and `r` reads the selected skill again.
 
+Global skills, the ones other coding agents use, work here too: `~/.agents/skills` (the shared folder the `npx skills` installer fills), `~/.claude/skills` (Claude Code), `~/.codex/skills` (Codex) and `~/.config/agents/skills`, plus `.agents/skills`, `.claude/skills` and `.codex/skills` in the current folder. They're read where they are, nothing is copied. `/skills` lists them under their own heading, and space turns one off; `"skills": { "use_global": false }` in settings.json turns them all off.
+
+## System prompts
+
+`/prompt` (or **Ctrl+S**) picks one. `/prompt a patient Rust tutor who explains with small examples` has the model write a new one instead: it is saved (tagged *generated*), used in this chat, and shown so you can read it (`e` opens it in your editor). The last row of the prompt list, **Write a new one with AI**, does the same, and **Ctrl+E** there edits the selected prompt in `$EDITOR`. From the command line:
+
+    aihat prompts new a patient Rust tutor --use    # --use: new chats use it
+
+## Reasoning effort
+
+`/effort` (or `/think`) sets how much a reasoning model thinks before it answers: off (the model decides), low, medium or high, sent as `reasoning_effort`; models without reasoning ignore it. It applies to the open chat, or to new chats when none is open, and the status line shows it when it isn't off. `/effort high` sets it straight away. For one prompt: `aihat -e high "why does this deadlock?"`.
+
+## About
+
+`/about` and `aihat about` show who made AI Hat (Aman Mohammed), with links to the portfolio, GitHub, the phone app, and a place to report a problem; enter opens the selected link. Ask the assistant who made it and it says both: which model it is and who made that model, and that this app was made by Aman Mohammed.
+
 ## Memory
 
 Memory is shared by every chat, like in the app. Models that can use tools keep it themselves (they save, correct and forget single memories, never all of them); for models that can't, a short request after each reply picks out what is worth keeping. `/memory` lists what is saved: `m` turns it on or off for this chat, `g` everywhere, `a` adds one and `d` forgets one. From the command line: `aihat memory`, `aihat memory add "I work in Rust"`, `aihat memory forget 2`, `aihat memory off`.
 
-The layout works from 80×24 up; under 100 columns the header drops the folder and dialogs go full width. The chat fills the whole terminal; replies wrap at 90 columns so they stay easy to read. To get the design's 112-column window instead, centred, set `"width": 112` in settings.json (`0` fills the terminal).
+The layout works from 80×24 up; under 100 columns the header drops the folder and dialogs go full width. The chat fills the whole terminal, and replies keep the design's share of the width (90 of 112 columns). To get the design's 112-column window instead, centred, set `"width": 112` in settings.json (`0` fills the terminal). The window's title reads like the design's: `aihat — ~/projects/fabric-mod · 112×34`.
 
 ## Pictures
 
-`/image a lighthouse in a storm` improves the idea into a fuller prompt, draws it, and shows a small preview over the chat with **Save to ~/Downloads**, **Save as…**, **Copy the picture** or **Discard**. Nothing is written until you choose; Save never overwrites a file. Saved pictures show as small previews in the chat, and so do pictures you attach with `@`.
+`/image a lighthouse in a storm` improves the idea into a fuller prompt, draws it, and shows it over the chat with **Save to ~/Downloads**, **Save as…**, **Copy the picture**, **View full screen** (`v`) or **Discard**. Nothing is written until you choose; Save never overwrites a file. Saved pictures show as small previews in the chat, and so do pictures you attach with `@`. The preview grows with the terminal.
 
-Previews are drawn with coloured half blocks, which work in any terminal with colour. Terminals that can show real pictures (kitty, Ghostty, WezTerm, iTerm2, foot, Konsole, Windows Terminal) get a sharp preview instead. To choose yourself:
+The first time a picture is shown, aihat asks the terminal what it can draw. Terminals that show real pictures (kitty, Ghostty, WezTerm, iTerm2, foot, Windows Terminal with sixel, and any other with sixel or the kitty protocol) get the picture itself. The rest get a drawing in block symbols: each cell takes the half, quarter or eighth block and the two colours that match its part of the picture best, which keeps edges and small details sharp. Inside tmux or screen, and on Windows consoles that don't pass answers back, it uses blocks. To compare, then choose:
 
-    aihat config set images.preview iterm2     # or kitty, sixel, blocks, off
+    aihat preview picture.png --as sixel       # or iterm2, kitty, blocks, halfblocks
+    aihat config set images.preview sixel      # auto (the default), kitty, sixel, iterm2, blocks, halfblocks, off
 
 ## Commands
 
     aihat --help
     aihat providers [list|add|test|set-default|set-key|set-url|remove]
     aihat models [list [--all]|refresh|set-default MODEL|add MODEL] [-P PROVIDER]
-    aihat prompts [list [--search WORD]|show|add|use|delete]
+    aihat prompts [list [--search WORD]|show|add|new DESCRIPTION [--use]|use|delete]
     aihat chats [list|show N|open N|export N [--json] [-o FILE]|rename|archive|delete]
-    aihat mcp [list|add NAME URL|add NAME -- COMMAND|login|logout|start|refresh|set-key|allow|ask|remove]
-    aihat skills [list|add PATH_OR_LINK|update|enable|disable|show|remove]
+    aihat mcp [list|add NAME URL|add NAME -- COMMAND|add NAME|search WORDS|login|logout|start|refresh|set-key|allow|ask|remove]
+    aihat skills [list|add SOURCE [--global]|search WORDS [--from skills.sh]|update|enable|disable|show|remove]
     aihat config [path|get [KEY]|set KEY VALUE|edit]
     aihat memory [list|add TEXT|forget N|on|off|clear]
     aihat backup [export [-o FILE]|import FILE]
     aihat search-key [set|remove] brave|tavily
     aihat image "a lighthouse in a storm" --count 2 [-o FILE_OR_FOLDER]
+    aihat preview PICTURE [--as kitty|sixel|iterm2|blocks|halfblocks]
+    aihat about
 
 `aihat image` shows each picture's preview and asks where to save it; with `-o`, `--yes`, or output to a pipe it saves without asking (to `-o`, or the `images.save_to` folder) and prints the path.
 
@@ -123,6 +159,7 @@ Chats are numbered in the order they were made (`aihat chats` shows `#41`), so `
     aihat "what changed in the Fabric API this month?" -w
     cat crash.log | aihat -s "Rust Systems Mentor" "why does this panic?"
     aihat -c "add a timeout on the join too"
+    aihat -e high "prove the loop terminates"     # reasoning effort: off, low, medium, high
     aihat "summarise" -f notes.md --json | jq .usage
     aihat "open an issue for this" -t github --yes
 
@@ -134,7 +171,7 @@ Exit codes: 0 ok · 1 error · 2 bad usage · 3 provider unreachable · 4 key re
 
 ## Web search
 
-Web search uses the provider by default: its `/search` endpoint, or Google Search grounding for FreeLLMAPI (a Gemini 2.5 Flash model must be available there). To use another engine:
+Web search uses the provider by default: its `/search` endpoint, or, for FreeLLMAPI, Google Search grounding through a Gemini model. aihat picks the newest Gemini Flash model FreeLLMAPI can run right now, and checks that the answer really came from Gemini: FreeLLMAPI hands a request to another provider when a model is retired or out of quota, and those can't search. Up to four Gemini models are tried; if none can search, the message says why. To use another engine:
 
     aihat search-key set brave
     aihat config set search.engine brave
@@ -169,6 +206,7 @@ Options live in `~/.config/aihat/settings.json` (`aihat config path` shows every
   "show_stats": true,
   "mouse": true,
   "images": { "preview": "auto", "save_to": "~/Downloads" },
+  "skills": { "use_global": true, "off": [] },
   "search": { "engine": "provider", "url": "", "results": 6 },
   "keys": {
     "send": "enter",

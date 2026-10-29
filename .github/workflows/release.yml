@@ -16,9 +16,11 @@ permissions:
   contents: read
 
 # On other branches and pull requests a newer push replaces a build still
-# running. Builds of main and of tags always finish; a newer one waits.
+# running. Every commit on main and every tag builds in full, side by side:
+# the arm64 BSD builds run emulated and take hours, so a newer build never
+# waits for them or stops them.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:

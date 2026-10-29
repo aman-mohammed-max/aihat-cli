@@ -34,7 +34,7 @@ fn running() -> &'static Mutex<HashMap<String, Running>> {
     RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn start(server: &McpServer) -> Result<Running> {
+fn start(server: &McpServer, env: &[(String, String)]) -> Result<Running> {
     let line = server.url.trim();
     if line.is_empty() {
         bail!("{} has no command to run", server.name);
@@ -49,6 +49,8 @@ fn start(server: &McpServer) -> Result<Running> {
         c.args(["-c", line]);
         c
     };
+    // Settings the program needs (saved with your keys when it was added).
+    command.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -170,11 +172,11 @@ impl Running {
 
 /// Send a request, starting the program (and introducing ourselves) first
 /// when it isn't running.
-pub fn request(server: &McpServer, method: &str, params: Value) -> Result<Value> {
+pub fn request(server: &McpServer, env: &[(String, String)], method: &str, params: Value) -> Result<Value> {
     let mut all = running().lock().map_err(|_| anyhow!("MCP programs are busy"))?;
     let restart = all.get_mut(&server.id).is_none_or(|run| !run.alive());
     if restart {
-        all.insert(server.id.clone(), start(server)?);
+        all.insert(server.id.clone(), start(server, env)?);
     }
     let run = all.get_mut(&server.id).expect("just started");
     let initialized = run.ensure_initialized(&server.name);
@@ -271,7 +273,7 @@ done"#;
             auth_header: None,
             auth_template: None,
         };
-        let tools = request(&server, "tools/list", json!({})).unwrap();
+        let tools = request(&server, &[], "tools/list", json!({})).unwrap();
         assert_eq!(tools["tools"][0]["name"], "query");
         assert!(is_running(&server.id));
         stop(Some(&server.id));

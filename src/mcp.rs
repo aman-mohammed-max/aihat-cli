@@ -46,7 +46,7 @@ fn rejected(error: &anyhow::Error) -> bool {
 /// turns the token down.
 fn rpc(server: &McpServer, secrets: &Secrets, method: &str, params: Value, id: u64) -> Result<Value> {
     if server.transport == "stdio" {
-        return crate::mcp_stdio::request(server, method, params);
+        return crate::mcp_stdio::request(server, &program_env(secrets, &server.id), method, params);
     }
     if server.auth != "oauth" {
         let token = secrets.mcp_token(&server.id);
@@ -67,6 +67,15 @@ fn rpc(server: &McpServer, secrets: &Secrets, method: &str, params: Value, id: u
         }
         other => other,
     }
+}
+
+/// The settings a program server reads from its environment, kept with the keys.
+fn program_env(secrets: &Secrets, id: &str) -> Vec<(String, String)> {
+    secrets
+        .get(&format!("mcp.{id}.env"))
+        .and_then(|raw| serde_json::from_str::<serde_json::Map<String, Value>>(&raw).ok())
+        .map(|map| map.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
+        .unwrap_or_default()
 }
 
 fn notify(server: &McpServer, secrets: &Secrets, method: &str, params: Value) -> Result<()> {
@@ -183,6 +192,7 @@ pub fn connect_server(
 /// Forget a server's sign-in and stop its program.
 pub fn forget(secrets: &Secrets, id: &str) {
     let _ = secrets.delete(&format!("mcp.{id}"));
+    let _ = secrets.delete(&format!("mcp.{id}.env"));
     crate::oauth::forget(secrets, id);
     crate::mcp_stdio::stop(Some(id));
 }

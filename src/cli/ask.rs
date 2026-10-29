@@ -30,6 +30,8 @@ pub struct Options {
     pub model: Option<String>,
     pub system: Option<String>,
     pub web: bool,
+    /// off, low, medium or high, for this chat.
+    pub effort: Option<String>,
     pub json: bool,
     pub stream: bool,
     pub continue_chat: bool,
@@ -136,6 +138,11 @@ pub fn run(env: &mut Env, options: Options) -> Result<i32> {
             ids.push(server.id.clone());
         }
         env.db.set_chat_tools(&chat.id, &ids)?;
+    }
+    if let Some(level) = &options.effort {
+        let mut params = if chat.params.is_object() { chat.params.clone() } else { json!({}) };
+        params["reasoning"] = json!(level);
+        env.db.set_chat_params(&chat.id, &params)?;
     }
     let chat = env.db.chat(&chat.id)?.unwrap_or(chat);
     let is_new = env.db.messages(&chat.id)?.is_empty();

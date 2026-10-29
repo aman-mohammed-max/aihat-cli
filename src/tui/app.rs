@@ -87,6 +87,23 @@ pub enum Task {
         command: String,
         result: Result<String, String>,
     },
+    /// A marketplace search answered; `token` says which search.
+    MarketResults {
+        token: u64,
+        result: Result<super::market::Found, String>,
+    },
+    MarketDetail {
+        key: String,
+        detail: super::market::Detail,
+    },
+    /// A marketplace skill put in ~/.agents/skills for every agent.
+    SkillInstalledGlobally {
+        result: Result<(String, std::path::PathBuf), String>,
+    },
+    /// The model wrote a system prompt: its name and text.
+    PromptWritten {
+        result: Result<(String, String), String>,
+    },
 }
 
 /// Something shown in the chat that is not a saved message.
@@ -127,6 +144,7 @@ pub struct Notice {
 pub enum Page {
     Chat,
     Providers(ProvidersPage),
+    Market(Box<super::market::MarketPage>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -179,6 +197,8 @@ pub struct App {
     pub pending_image: Option<Box<super::images::ImageViewer>>,
     /// /settings: the event loop hands the terminal to an editor.
     pub edit_settings: bool,
+    /// A system prompt to open in the editor.
+    pub edit_prompt: Option<String>,
     /// Where "Jump to bottom" was drawn, for clicks.
     pub jump_button: Option<ratatui::layout::Rect>,
     /// Stops a browser sign-in that is waiting.
@@ -240,6 +260,7 @@ impl App {
             drawing: None,
             pending_image: None,
             edit_settings: false,
+            edit_prompt: None,
             jump_button: None,
             sign_in_cancel: None,
             form_token: 0,
@@ -275,7 +296,7 @@ impl App {
             " ✗ ",
             t.fg(Role::Error),
             &[(text.to_string(), t.fg(Role::Error))],
-            transcript::MAX_TEXT_WIDTH.min(self.width as usize),
+            transcript::prose_width(self.width as usize).min(self.width as usize),
         );
         lines.truncate(6);
         self.push_local(lines);
@@ -784,10 +805,31 @@ impl App {
                     self.pick_prompt_by_name(args);
                 }
             }
+            "newprompt" => {
+                if args.is_empty() {
+                    self.dialog = Some(Dialog::Form(dialogs::Form::write_prompt()));
+                } else {
+                    self.write_prompt(args);
+                }
+            }
             "providers" | "provider" => self.open_providers(),
             "tools" => self.dialog = Some(Dialog::Tools(dialogs::ToolsDialog::new(self))),
             "mcp" => self.dialog = Some(Dialog::Mcp(dialogs::ListDialog::default())),
             "skills" => self.dialog = Some(Dialog::Skills(dialogs::ListDialog::default())),
+            "market" | "marketplace" | "store" => self.open_market(args),
+            "effort" | "think" | "reasoning" => {
+                let level = match args.to_lowercase().as_str() {
+                    "none" | "0" => "off".to_string(),
+                    other => other.to_string(),
+                };
+                if dialogs::EFFORTS.iter().any(|(known, _)| *known == level) {
+                    self.set_effort(&level);
+                } else if args.is_empty() {
+                    self.dialog = Some(Dialog::Effort(dialogs::EffortPicker::new(self)));
+                } else {
+                    self.fail(format!("Effort is off, low, medium or high, not {args:?}"));
+                }
+            }
             "new" | "clear-chat" => self.new_chat(),
             "resume" | "history" | "chats" => self.open_history(),
             "compact" => self.compact(),
@@ -806,6 +848,7 @@ impl App {
             "clear" => self.clear_screen(),
             "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
+            "about" | "version" => self.dialog = Some(Dialog::About(Default::default())),
             "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
             "" => {}
@@ -828,6 +871,53 @@ impl App {
     pub fn open_providers(&mut self) {
         self.dialog = None;
         self.page = Page::Providers(ProvidersPage::new(self));
+    }
+
+    /// The reasoning effort this chat sends (or new chats will): off, low,
+    /// medium or high.
+    pub fn current_effort(&self) -> String {
+        let params = match (&self.chat, self.current_selection()) {
+            (Some(chat), _) => chat.params.clone(),
+            (None, Some((provider, model))) => self.db.default_params(&provider.id, &model),
+            (None, None) => self.db.settings().get("defaultParams").cloned().unwrap_or_default(),
+        };
+        params.get("reasoning").and_then(Value::as_str).filter(|level| !level.is_empty()).unwrap_or("off").to_string()
+    }
+
+    /// `/effort high`: for this chat, or for new chats when there is none.
+    pub fn set_effort(&mut self, level: &str) {
+        let saved = match self.chat.clone() {
+            Some(chat) => {
+                let mut params = if chat.params.is_object() { chat.params.clone() } else { json!({}) };
+                params["reasoning"] = json!(level);
+                self.db.set_chat_params(&chat.id, &params).map(|_| {
+                    if let Some(open) = self.chat.as_mut() {
+                        open.params = params;
+                    }
+                })
+            }
+            None => {
+                let mut settings = self.db.settings();
+                if !settings.get("defaultParams").is_some_and(Value::is_object) {
+                    settings["defaultParams"] = json!({"temperature": 0.7, "maxTokens": 4096, "topP": 0.95, "stream": true});
+                }
+                settings["defaultParams"]["reasoning"] = json!(level);
+                self.db.set_kv("settings", &settings.to_string())
+            }
+        };
+        match saved {
+            Ok(()) if level == "off" => self.ok("Reasoning effort: off · the model decides"),
+            Ok(()) => self.ok(format!("Reasoning effort: {level}")),
+            Err(error) => self.fail(error.to_string()),
+        }
+    }
+
+    /// `/market`, or `/market mcp` to start on MCP servers.
+    pub fn open_market(&mut self, args: &str) {
+        use super::market::{MarketPage, Tab};
+        let tab = if args.to_lowercase().starts_with("mcp") { Tab::Mcp } else { Tab::Skills };
+        self.dialog = None;
+        self.page = Page::Market(Box::new(MarketPage::new(tab)));
     }
 
     fn pick_model_by_name(&mut self, query: &str) {
@@ -906,16 +996,27 @@ impl App {
             return;
         }
         let wanted = query.to_lowercase();
-        let found = self
-            .db
-            .prompts()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|prompt| prompt.name.to_lowercase().contains(&wanted));
+        let found = self.db.prompts().unwrap_or_default().into_iter().find(|prompt| prompt.name.to_lowercase() == wanted);
         match found {
             Some(prompt) => self.apply_prompt(Some(prompt.id), false),
-            None => self.fail(format!("No system prompt matches {query:?} · {} lists them", keys::label(Action::SwitchPrompt))),
+            // Not a saved prompt's name: a description for the model to write one.
+            None => self.write_prompt(query),
         }
+    }
+
+    /// `/prompt a patient Rust tutor`: the model writes a system prompt; it
+    /// is saved and used in this chat, as in the app.
+    pub fn write_prompt(&mut self, description: &str) {
+        let Some((provider, model)) = self.current_selection() else {
+            self.fail("Add an endpoint and pick a chat model first · /providers");
+            return;
+        };
+        self.busy_task = Some("writing your system prompt".into());
+        let ctx = self.ctx.clone();
+        let description = description.trim().to_string();
+        self.spawn_task(move || Task::PromptWritten {
+            result: engine::write_system_prompt(&ctx.secrets, &provider, &model, &description).map_err(|e| describe_error(&e)),
+        });
     }
 
     pub fn apply_prompt(&mut self, prompt_id: Option<String>, make_default: bool) {
@@ -1141,6 +1242,7 @@ impl App {
                     || config.ascii != self.config.ascii
                     || serde_json::to_value(&config.keys).ok() != serde_json::to_value(&self.config.keys).ok();
                 self.show_reasoning = config.show_reasoning;
+                crate::skills::set_global_policy(config.skills.use_global, &config.skills.off);
                 self.ctx.config = config.clone();
                 self.config = config;
                 self.cache.clear();
@@ -1233,7 +1335,10 @@ impl App {
     // ---------------------------------------------------------------- tasks
 
     fn on_task(&mut self, task: Task) {
-        self.busy_task = None;
+        // Marketplace lookups run quietly beside other work.
+        if !matches!(task, Task::MarketResults { .. } | Task::MarketDetail { .. }) {
+            self.busy_task = None;
+        }
         match task {
             Task::ProviderTested { provider_id, result } => {
                 if let Page::Providers(page) = &mut self.page {
@@ -1334,6 +1439,27 @@ impl App {
                 self.dialog = Some(Dialog::Form(dialogs::Form::mcp_token(&id, &name)));
                 self.notify(Role::Warn, format!("{name} needs an access token"));
             }
+            Task::PromptWritten { result } => match result {
+                Ok((name, body)) => match self.db.add_prompt_tagged(&name, &body, &["generated"]) {
+                    Ok(id) => {
+                        if self.ensure_chat().is_ok() {
+                            self.apply_prompt(Some(id.clone()), false);
+                        }
+                        self.ok(format!("Saved “{name}” and set it for this chat"));
+                        if self.dialog.is_none() {
+                            self.dialog = Some(Dialog::Text(dialogs::TextView::written_prompt(&id, &name, &body)));
+                        }
+                    }
+                    Err(error) => self.fail(format!("Could not save the prompt: {error}")),
+                },
+                Err(error) => self.fail(format!("Could not write the prompt: {error}")),
+            },
+            Task::MarketResults { token, result } => super::market::on_results(self, token, result),
+            Task::MarketDetail { key, detail } => super::market::on_detail(self, key, detail),
+            Task::SkillInstalledGlobally { result } => match result {
+                Ok((name, dir)) => self.ok(format!("Added {name} for every agent · {}", text::home_relative(&dir))),
+                Err(error) => self.fail(format!("Could not add it: {error}")),
+            },
             Task::Shell { command, result } => {
                 let t = theme();
                 match result {
@@ -1393,6 +1519,9 @@ impl App {
             self.composer.insert(text);
             self.history_index = None;
         }
+        if self.dialog.is_none() && matches!(self.page, Page::Market(_)) {
+            super::market::on_paste(self, text);
+        }
     }
 
     /// The wheel scrolls the chat (or moves through an open list); a click
@@ -1404,7 +1533,7 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = mouse.kind == MouseEventKind::ScrollUp;
-                if self.dialog.is_some() || matches!(self.page, Page::Providers(_)) {
+                if self.dialog.is_some() || matches!(self.page, Page::Providers(_) | Page::Market(_)) {
                     self.on_key(arrow(if up { KeyCode::Up } else { KeyCode::Down }));
                 } else if up {
                     self.scroll = self.scroll.saturating_add(3);
@@ -1446,6 +1575,10 @@ impl App {
         }
         if matches!(self.page, Page::Providers(_)) {
             super::providers::on_key(self, key);
+            return;
+        }
+        if matches!(self.page, Page::Market(_)) {
+            super::market::on_key(self, key);
             return;
         }
         if let Some(popup) = self.popup()

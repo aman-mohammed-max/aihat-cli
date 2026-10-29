@@ -552,19 +552,22 @@ pub fn search_provider(
 }
 
 /// Use FreeLLMAPI's Gemini Google Search grounding through its OpenAI-compatible
-/// tool bridge. This keeps web search on the user's configured provider instead
-/// of assuming a separate local SearXNG process is installed.
+/// tool bridge, on `model`. This keeps web search on the user's configured
+/// provider instead of assuming a separate local SearXNG process is installed.
+/// Returns the answer and where FreeLLMAPI says it sent the request
+/// (`X-Routed-Via`, with `X-Fallback-Trail` when it moved it).
 pub fn search_google_grounded(
     provider: &Provider,
     secrets: &Secrets,
     query: &str,
     count: usize,
-) -> Result<Value> {
+    model: &str,
+) -> Result<(Value, String)> {
     let prompt = format!(
         "Search the web for this query: {query}\n\nReturn only valid JSON in this exact shape: {{\"results\":[{{\"title\":\"page title\",\"url\":\"https://...\",\"snippet\":\"short relevant excerpt\"}}]}}. Return up to {count} distinct pages actually found by Google Search. Use their exact page URLs and titles. Do not invent a URL, and do not add prose or Markdown outside the JSON."
     );
     let body = json!({
-        "model": "gemini-2.5-flash",
+        "model": model,
         "messages": [
             {"role":"system","content":"You are a web search result extractor. Use Google Search grounding for every query. Return source pages only."},
             {"role":"user","content":prompt}
@@ -576,13 +579,15 @@ pub fn search_google_grounded(
         "stream": false,
         "temperature": 0
     });
-    let response = client(provider.timeout_ms.max(60_000))?
+    let response = client(provider.timeout_ms.clamp(30_000, 60_000))?
         .post(endpoint(provider, "chat/completions"))
         .headers(headers(provider, secrets)?)
         .json(&body)
         .send_retry()
         .context("connecting to FreeLLMAPI Google Search grounding")?;
-    checked_json(response)
+    let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let route = [header("x-routed-via"), header("x-fallback-trail")].into_iter().filter(|h| !h.is_empty()).collect::<Vec<_>>().join(" · ");
+    Ok((checked_json(response)?, route))
 }
 
 pub fn search_brave(query: &str, count: usize, safe: bool, key: &str) -> Result<Value> {

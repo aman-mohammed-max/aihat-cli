@@ -36,6 +36,9 @@ pub const COMMANDS: &[Command] = &[
     command("tools", "web search, image, MCP tools for this chat", None, false),
     command("mcp", "MCP servers and sign-in", None, false),
     command("skills", "turn skills on or off", None, false),
+    command("market", "find skills and MCP servers to add", None, false),
+    command("effort", "how much the model thinks: off, low, medium, high", None, false),
+    command("newprompt", "describe an assistant · the model writes its system prompt", None, true),
     command("new", "start a new chat", Some(Action::NewChat), false),
     command("resume", "open a past chat", Some(Action::PastChats), false),
     command("compact", "summarise to free context", None, false),
@@ -49,6 +52,7 @@ pub const COMMANDS: &[Command] = &[
     command("memory", "what models remember · on or off for this chat", None, false),
     command("keys", "show every key", Some(Action::ShowKeys), false),
     command("settings", "open settings.json", None, false),
+    command("about", "who made AI Hat · links", None, false),
     command("quit", "leave aihat", Some(Action::Quit), false),
 ];
 
@@ -112,9 +116,10 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
     let chat = Rect::new(area.x, header.bottom(), area.width, composer.y.saturating_sub(header.bottom()));
 
     draw_header(app, buf, header);
-    let providers = matches!(app.page, Page::Providers(_));
-    if providers {
+    if matches!(app.page, Page::Providers(_)) {
         super::providers::draw(app, buf, chat);
+    } else if matches!(app.page, Page::Market(_)) {
+        super::market::draw(app, buf, chat);
     } else if app.is_welcome() {
         draw_welcome(app, buf, chat);
     } else {
@@ -396,6 +401,9 @@ fn placeholder(app: &App, narrow: bool) -> String {
     if let Page::Providers(_) = app.page {
         return "/providers · esc back to chat".into();
     }
+    if let Page::Market(_) = app.page {
+        return "/market · type to search · esc back to chat".into();
+    }
     if let Some(turn) = &app.turn {
         if turn.approval.is_some() {
             return "Waiting for your answer…".into();
@@ -465,6 +473,7 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
         Some(notice) => Line::styled(notice.text.clone(), t.fg(notice.role)),
         None => match (&app.page, narrow) {
             (Page::Providers(_), _) => Line::styled("↑↓ move · tab switch pane · a add · t test · d default · esc back", dim),
+            (Page::Market(_), _) => Line::styled("type to search · ↑↓ move · tab skills/MCP · enter add · esc back", dim),
             (_, true) => Line::styled(format!("{} keys · {} model", keys::label(Action::ShowKeys), keys::label(Action::SwitchModel)), dim),
             _ if app.editing_last.is_some() => Line::styled(format!("{} resend · esc cancel the edit", keys::label(Action::Send)), dim),
             _ => Line::styled(
@@ -498,6 +507,15 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
                 dim,
             ));
         }
+        Page::Market(page) => {
+            if let Some(task) = &app.busy_task {
+                right.push(Span::styled(format!("● {task}"), t.fg(Role::Warn)));
+            } else if page.loading {
+                right.push(Span::styled("● searching", t.fg(Role::Warn)));
+            } else {
+                right.push(Span::styled(text::plural(page.items.len(), "result", "results"), dim));
+            }
+        }
         Page::Chat => {
             let context = context_label(app, narrow);
             if let Some(turn) = &app.turn {
@@ -514,7 +532,8 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
                     .and_then(|(provider, _)| provider.latency_ms)
                     .filter(|_| !narrow)
                     .map(text::duration);
-                let parts: Vec<String> = [Some(context), latency].into_iter().flatten().filter(|p| !p.is_empty()).collect();
+                let effort = Some(app.current_effort()).filter(|level| level != "off").map(|level| format!("{level} effort"));
+                let parts: Vec<String> = [effort, Some(context), latency].into_iter().flatten().filter(|p| !p.is_empty()).collect();
                 right.push(Span::styled(parts.join(" · "), dim));
             }
         }

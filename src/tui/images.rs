@@ -1,5 +1,6 @@
-//! A new picture from `/image`: a small preview over the dimmed chat, then
-//! Save, Save as…, Copy or Discard. Nothing is written until you choose.
+//! A new picture from `/image`: a preview over the dimmed chat, then Save,
+//! Save as…, Copy or Discard; v shows it on the whole screen. Nothing is
+//! written until you choose.
 //!
 //! ```text
 //! ╭─ Save this picture? ─────────────────────────────────────── 1 of 2 · ← → ─╮
@@ -32,6 +33,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui_image::protocol::Protocol;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// What the image service sent back, before anything is saved.
@@ -74,11 +76,16 @@ pub struct ImageViewer {
     selection: usize,
     save_as: Option<Composer>,
     error: Option<String>,
-    /// The preview for (picture, columns, rows), kept between frames.
-    cache: RefCell<Option<(PreviewKey, Rendered)>>,
+    /// The picture on the whole screen.
+    full: bool,
+    /// Previews by (picture, columns, rows), kept between frames.
+    cache: RefCell<HashMap<PreviewKey, Rendered>>,
 }
 
-const OPTIONS: [(&str, &str); 4] = [("", "enter"), ("Save as…", "s"), ("Copy the picture", "c"), ("Discard", "esc")];
+const OPTIONS: [(&str, &str); 5] = [("", "enter"), ("Save as…", "s"), ("Copy the picture", "c"), ("View full screen", "v"), ("Discard", "esc")];
+
+/// Room the words beside the preview need.
+const WORDS: u16 = 46;
 
 impl ImageViewer {
     pub fn new(chat_id: String, prompt: String, drawn: Drawn, ms: u64) -> Self {
@@ -94,7 +101,8 @@ impl ImageViewer {
             selection: 0,
             save_as: None,
             error: None,
-            cache: RefCell::new(None),
+            full: false,
+            cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -104,23 +112,31 @@ impl ImageViewer {
     }
 
     pub fn draw(&self, app: &App, buf: &mut Buffer, screen: Rect) {
+        if self.full {
+            self.draw_full(app, buf, screen);
+            return;
+        }
         let t = theme();
-        let height = 20.min(screen.height.saturating_sub(6)).max(10);
-        let area = draw::dialog_rect(screen, 100, height, 3);
+        let item = &self.items[self.index];
+        // The design's 20 rows on a 34-row window; taller windows get a
+        // bigger picture, and the box grows to hold it.
+        let height = screen.height.saturating_sub(14).clamp(20, 44).min(screen.height.saturating_sub(6)).max(10);
+        let (w, h) = item.picture.image.dimensions();
+        let max_cols = screen.width.saturating_sub(WORDS + 11).max(16);
+        let (cols, rows) = picture::fit(w, h, max_cols, height - 2);
+        let width = (cols + WORDS + 7).max(100).min(screen.width.saturating_sub(4).max(40));
+        let area = draw::dialog_rect(screen, width, height, 3);
         let count = self.items.len();
         let right = if count > 1 { format!("{} of {count} · ← →", self.index + 1) } else { String::new() };
         draw::boxed(buf, area, t.fg(Role::Accent), "Save this picture?", &right);
         let inner = draw::inner(area);
-        let item = &self.items[self.index];
+        let (cols, rows) = if cols + WORDS + 3 > inner.width { picture::fit(w, h, inner.width.saturating_sub(WORDS + 3).max(12), inner.height) } else { (cols, rows) };
 
-        // The preview on the left, about half the box.
-        let preview_cols = (inner.width * 9 / 20).clamp(16, 46);
-        let (w, h) = item.picture.image.dimensions();
-        let (cols, rows) = picture::fit(w, h, preview_cols, inner.height);
-        self.draw_preview(app, buf, Rect::new(inner.x, inner.y, cols, rows));
+        // The preview on the left.
+        self.draw_preview(app, buf, Rect::new(inner.x, inner.y, cols, rows.min(inner.height)));
 
         // Words on the right.
-        let x = inner.x + preview_cols + 3;
+        let x = inner.x + cols + 3;
         let right_edge = inner.right();
         let column = right_edge.saturating_sub(x) as usize;
         let mut y = inner.y;
@@ -195,22 +211,42 @@ impl ImageViewer {
         }
     }
 
+    /// The picture as large as the screen allows, with the keys under it.
+    fn draw_full(&self, app: &App, buf: &mut Buffer, screen: Rect) {
+        let t = theme();
+        draw::fill(buf, screen, t.base());
+        let (w, h) = self.items[self.index].picture.image.dimensions();
+        let (cols, rows) = picture::fit(w, h, screen.width, screen.height.saturating_sub(2));
+        let x = screen.x + (screen.width - cols) / 2;
+        self.draw_preview(app, buf, Rect::new(x, screen.y, cols, rows));
+        let count = self.items.len();
+        let which = if count > 1 { format!("{} of {count} · ← → · ", self.index + 1) } else { String::new() };
+        let hint = format!("{which}{} · v or esc back · enter save · s save as · c copy", self.items[self.index].picture.describe());
+        let hint = text::truncate(&hint, screen.width as usize);
+        let hint_x = screen.x + (screen.width.saturating_sub(text::width(&hint) as u16)) / 2;
+        put(buf, hint_x, screen.bottom() - 1, &hint, t.fg(Role::Dim), screen.right());
+    }
+
     fn draw_preview(&self, app: &App, buf: &mut Buffer, area: Rect) {
         let t = theme();
         let key = (self.index, area.width, area.height);
         let mut cache = self.cache.borrow_mut();
-        if cache.as_ref().is_none_or(|(cached, _)| *cached != key) {
+        if !cache.contains_key(&key) {
             let image = &self.items[self.index].picture.image;
-            let rendered = match picture::preview(&app.config.images.preview) {
+            let how = picture::preview(&app.config.images.preview);
+            let rendered = match how {
                 Preview::Off => Rendered::Words,
-                Preview::Blocks => picture::blocks(image, area.width, area.height).map(Rendered::Blocks).unwrap_or(Rendered::Words),
                 Preview::Graphics(picker) => picture::graphics(picker, image, area.width, area.height)
                     .map(Rendered::Graphics)
                     .unwrap_or(Rendered::Words),
+                cells => cells.cells(image, area.width, area.height).map(Rendered::Blocks).unwrap_or(Rendered::Words),
             };
-            *cache = Some((key, rendered));
+            if cache.len() >= 6 {
+                cache.clear();
+            }
+            cache.insert(key, rendered);
         }
-        match cache.as_ref().map(|(_, rendered)| rendered) {
+        match cache.get(&key) {
             Some(Rendered::Blocks(lines)) => {
                 for (offset, line) in lines.iter().enumerate() {
                     put_line(buf, area.x, area.y + offset as u16, line, area.right());
@@ -259,6 +295,10 @@ impl ImageViewer {
             // A saved picture: any key moves on.
             return self.advance(app);
         }
+        if self.full && matches!(key.code, KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q')) {
+            self.full = false;
+            return true;
+        }
         match key.code {
             KeyCode::Up => self.selection = self.selection.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => self.selection = (self.selection + 1).min(OPTIONS.len() - 1),
@@ -267,7 +307,8 @@ impl ImageViewer {
             KeyCode::Enter => return self.choose(app, self.selection),
             KeyCode::Char('s') => return self.choose(app, 1),
             KeyCode::Char('c') => return self.choose(app, 2),
-            KeyCode::Esc | KeyCode::Char('d') => return self.choose(app, 3),
+            KeyCode::Char('v') => return self.choose(app, 3),
+            KeyCode::Esc | KeyCode::Char('d') => return self.choose(app, 4),
             _ => {}
         }
         true
@@ -301,6 +342,10 @@ impl ImageViewer {
                     Ok(()) => app.ok("Copied the picture"),
                     Err(error) => self.error = Some(format!("Could not copy it: {error}")),
                 }
+                true
+            }
+            3 => {
+                self.full = true;
                 true
             }
             _ => {
@@ -338,6 +383,7 @@ impl ImageViewer {
     /// Show the next picture still waiting for an answer, or finish.
     fn advance(&mut self, app: &mut App) -> bool {
         self.selection = 0;
+        self.full = false;
         let count = self.items.len();
         if let Some(next) = (1..=count).map(|step| (self.index + step) % count).find(|i| self.items[*i].outcome.is_none()) {
             self.index = next;

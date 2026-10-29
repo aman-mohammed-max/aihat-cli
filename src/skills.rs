@@ -149,6 +149,164 @@ fn collect_skill_files(
     Ok(())
 }
 
+/// A skill another coding agent installed on this computer, read from its
+/// folder (nothing is copied into AI Hat's database).
+#[derive(Clone, Debug)]
+pub struct Global {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub dir: std::path::PathBuf,
+    /// Where it was found, for showing: "~/.claude/skills".
+    pub place: String,
+}
+
+/// Whether global skills are used, and which are turned off. Set once from
+/// settings.json at start (and again when settings change).
+static GLOBAL_POLICY: std::sync::RwLock<(bool, Vec<String>)> = std::sync::RwLock::new((true, Vec::new()));
+
+pub fn set_global_policy(use_global: bool, off: &[String]) {
+    if let Ok(mut policy) = GLOBAL_POLICY.write() {
+        *policy = (use_global, off.iter().map(|name| name.to_lowercase()).collect());
+    }
+}
+
+fn global_policy() -> (bool, Vec<String>) {
+    GLOBAL_POLICY.read().map(|policy| policy.clone()).unwrap_or((true, Vec::new()))
+}
+
+/// The folders agents keep skills in, most specific first: this project's,
+/// then the shared ~/.agents/skills, then each agent's own.
+pub fn global_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(project) = std::env::current_dir() {
+        for dir in [".agents/skills", ".claude/skills", ".codex/skills"] {
+            roots.push(project.join(dir));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        for dir in [".agents/skills", ".claude/skills", ".codex/skills", ".config/agents/skills"] {
+            roots.push(home.join(dir));
+        }
+    }
+    roots
+}
+
+/// Every global skill on this computer, one per name (the most specific
+/// folder wins; the same folder linked from several agents counts once).
+pub fn globals() -> Vec<Global> {
+    let mut found: Vec<Global> = Vec::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+    for root in global_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let dir = entry.path();
+            let skill_md = dir.join("SKILL.md");
+            if !skill_md.is_file() {
+                continue;
+            }
+            let real = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if !seen_dirs.insert(real) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&skill_md) else { continue };
+            let fallback = entry.file_name().to_string_lossy().into_owned();
+            let (name, description, body) = parse_skill(&text, &fallback);
+            if name.trim().is_empty() || body.trim().is_empty() || found.iter().any(|g| g.name.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            found.push(Global {
+                name,
+                description,
+                body,
+                dir,
+                place: crate::ui::text::home_relative(&root),
+            });
+        }
+    }
+    found
+}
+
+/// Global skills in use: on, and not shadowed by a skill of the same name
+/// in AI Hat's own library.
+pub fn active_globals(library: &[crate::models::Skill]) -> Vec<Global> {
+    let (use_global, off) = global_policy();
+    if !use_global {
+        return Vec::new();
+    }
+    globals()
+        .into_iter()
+        .filter(|g| !off.contains(&g.name.to_lowercase()))
+        .filter(|g| !library.iter().any(|s| s.name.eq_ignore_ascii_case(&g.name)))
+        .collect()
+}
+
+pub fn global_is_off(name: &str) -> bool {
+    let (use_global, off) = global_policy();
+    !use_global || off.contains(&name.to_lowercase())
+}
+
+/// A file that comes with a global skill, by its path inside the skill's folder.
+pub fn global_file(skill: &Global, path: &str) -> Result<String> {
+    let path = path.replace('\\', "/");
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        anyhow::bail!("Invalid skill file path.");
+    }
+    let full = skill.dir.join(&path);
+    let real = full.canonicalize().with_context(|| format!("No file {path:?} in skill {:?}.", skill.name))?;
+    let root = skill.dir.canonicalize().unwrap_or_else(|_| skill.dir.clone());
+    if !real.starts_with(&root) {
+        anyhow::bail!("Invalid skill file path.");
+    }
+    let text = std::fs::read_to_string(&real).with_context(|| format!("{path} is not a text file"))?;
+    Ok(text.chars().take(100_000).collect())
+}
+
+/// Install a skill for every agent on this computer: its files go to
+/// ~/.agents/skills/<name>, and Claude Code's and Codex's skill folders get
+/// a link to it when they exist. Returns the folder.
+pub fn install_global(loaded: &Loaded) -> Result<std::path::PathBuf> {
+    let (name, _, body, _, files) = loaded;
+    let home = dirs::home_dir().context("no home folder")?;
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let dir = home.join(".agents/skills").join(slug.trim_matches('-'));
+    if dir.exists() {
+        anyhow::bail!("{} already exists", crate::ui::text::home_relative(&dir));
+    }
+    std::fs::create_dir_all(&dir)?;
+    let has_md = files.iter().any(|(path, _)| path.eq_ignore_ascii_case("SKILL.md"));
+    if !has_md {
+        let (_, description, _, _, _) = loaded;
+        let front = format!("---\nname: {name}\ndescription: {}\n---\n\n{body}\n", description.replace('\n', " "));
+        std::fs::write(dir.join("SKILL.md"), front)?;
+    }
+    for (path, text) in files {
+        if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+            continue;
+        }
+        let target = dir.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, text)?;
+    }
+    #[cfg(unix)]
+    for agent in [".claude/skills", ".codex/skills"] {
+        let agent_dir = home.join(agent);
+        let link = agent_dir.join(dir.file_name().unwrap_or_default());
+        if agent_dir.is_dir() && !link.exists() {
+            let _ = std::os::unix::fs::symlink(&dir, &link);
+        }
+    }
+    Ok(dir)
+}
+
 /// A skill as read from its source: name, description, body, where it came
 /// from, and its text files.
 pub type Loaded = (String, String, String, String, Vec<(String, String)>);
@@ -167,12 +325,22 @@ pub fn load(input: &str) -> Result<Loaded> {
     }
 }
 
-/// Read a skill again from where it came from (its folder, or GitHub).
+/// Read a skill again from where it came from (its folder, GitHub, or the
+/// website that publishes it: `vercel.com/deploy-to-vercel`).
 pub fn reload(source: &str) -> Result<Loaded> {
-    match github_source(source) {
-        Some(found) => fetch_github(&found, true),
-        None => read_skill_source(&expand(source)),
+    if let Some(found) = github_source(source) {
+        return fetch_github(&found, true);
     }
+    let local = expand(source);
+    if !local.exists()
+        && let Some((site, name)) = source.split_once('/')
+        && crate::market::parse_site_ref(site).is_some()
+    {
+        let listed = crate::market::site_skills(site)?;
+        let item = listed.iter().find(|item| item.name == name).with_context(|| format!("{site} no longer publishes {name}"))?;
+        return crate::market::load_site_skill(item);
+    }
+    read_skill_source(&local)
 }
 
 pub fn is_github(source: &str) -> bool {
@@ -236,14 +404,14 @@ fn github_source(source: &str) -> Option<GithubRef> {
     source.starts_with("github.com/").then(|| parse_github(source)).flatten()
 }
 
-const TEXT_EXT: &[&str] = &[
+pub(crate) const TEXT_EXT: &[&str] = &[
     "md", "markdown", "txt", "rst", "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "csv", "tsv", "xml", "html", "htm", "css", "js",
     "mjs", "cjs", "ts", "tsx", "jsx", "py", "sh", "bash", "zsh", "rb", "php", "go", "rs", "java", "kt", "swift", "c", "h", "cpp", "hpp", "cs",
     "sql", "r", "lua", "pl", "tex", "bib",
 ];
-const MAX_REMOTE_FILES: usize = 60;
-const MAX_REMOTE_FILE: u64 = 150_000;
-const MAX_REMOTE_TOTAL: u64 = 1_200_000;
+pub(crate) const MAX_REMOTE_FILES: usize = 60;
+pub(crate) const MAX_REMOTE_FILE: u64 = 150_000;
+pub(crate) const MAX_REMOTE_TOTAL: u64 = 1_200_000;
 
 fn github_get(url: &str) -> Result<reqwest::blocking::Response> {
     use crate::api::SendRetry;
@@ -256,7 +424,7 @@ fn github_get(url: &str) -> Result<reqwest::blocking::Response> {
 }
 
 /// Every file in the repository with its size, from one GitHub API call.
-fn repo_files(found: &GithubRef, git_ref: &str) -> Result<Vec<(String, u64)>> {
+pub(crate) fn repo_files(found: &GithubRef, git_ref: &str) -> Result<Vec<(String, u64)>> {
     let url = format!("https://api.github.com/repos/{}/{}/git/trees/{git_ref}?recursive=1", found.owner, found.repo);
     let response = github_get(&url)?;
     match response.status().as_u16() {
@@ -279,7 +447,7 @@ fn repo_files(found: &GithubRef, git_ref: &str) -> Result<Vec<(String, u64)>> {
         .unwrap_or_default())
 }
 
-fn raw_text(found: &GithubRef, git_ref: &str, path: &str) -> Option<String> {
+pub(crate) fn raw_text(found: &GithubRef, git_ref: &str, path: &str) -> Option<String> {
     let url = format!("https://raw.githubusercontent.com/{}/{}/{git_ref}/{}", found.owner, found.repo, path.trim_start_matches('/'));
     let response = github_get(&url).ok()?;
     if !response.status().is_success() {
@@ -377,8 +545,8 @@ pub fn fetch_github(found: &GithubRef, with_files: bool) -> Result<Loaded> {
             total += size;
             chosen.push(rel);
         }
-        // Six downloads at a time.
-        for batch in chosen.chunks(6) {
+        // Twelve downloads at a time: each file is its own request.
+        for batch in chosen.chunks(12) {
             let fetched: Vec<Option<String>> = std::thread::scope(|scope| {
                 let jobs: Vec<_> = batch
                     .iter()

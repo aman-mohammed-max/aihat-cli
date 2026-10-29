@@ -1,3 +1,4 @@
+mod about;
 mod api;
 mod backup;
 mod cli;
@@ -8,6 +9,7 @@ mod export;
 mod files;
 mod genui;
 mod imagegen;
+mod market;
 mod mcp;
 mod mcp_stdio;
 mod memory;

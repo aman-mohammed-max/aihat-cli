@@ -83,7 +83,26 @@ pub struct AppConfig {
     pub mouse: bool,
     pub images: ImageConfig,
     pub search: SearchConfig,
+    pub skills: SkillsConfig,
     pub keys: KeyConfig,
+}
+
+/// Skills other coding agents installed on this computer (Claude Code,
+/// Codex, the `skills` tool…) are used too, unless turned off here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Read ~/.agents/skills, ~/.claude/skills, ~/.codex/skills and the
+    /// same folders in the current project.
+    pub use_global: bool,
+    /// Global skills turned off, by name.
+    pub off: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self { use_global: true, off: Vec::new() }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,6 +188,7 @@ impl Default for AppConfig {
             mouse: true,
             images: ImageConfig::default(),
             search: SearchConfig::default(),
+            skills: SkillsConfig::default(),
             keys: KeyConfig::default(),
         }
     }

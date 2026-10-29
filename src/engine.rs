@@ -120,6 +120,55 @@ pub fn last_user_text(messages: &[Value]) -> String {
     }
 }
 
+/// Who the model is and who made the app, so "who made you?" gets both answers.
+fn identity(model: &str, provider: Option<&str>) -> String {
+    let reached = match provider {
+        Some(provider) => format!("through {provider}"),
+        None => "through the user's own provider".to_string(),
+    };
+    let model_line = if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+        format!("You are an AI model reached {reached}, with the model setting \"{}\", so the exact model can change from message to message.", if model.is_empty() { "default" } else { model })
+    } else {
+        format!("You are the model \"{model}\", reached {reached}.")
+    };
+    format!(
+        "{model_line} The user is talking to you in AI Hat CLI, the terminal version of AI Hat, an AI chat app made by Aman Mohammed (amanm.space, github.com/aman-mohammed-max). \
+If the user asks who made you, who you are, or what app this is, answer both parts: which model you are and the company or team that made that model (only what you actually know), and that the app they are using, AI Hat, was made by Aman Mohammed."
+    )
+}
+
+/// What the model is told when it writes a system prompt (as in the app).
+const PROMPT_WRITER: &str = "You write system prompts for AI assistants. Given a short description of the assistant someone wants, write a complete, well-structured system prompt in the second person (\"You are…\"): role, tone, what to do, what to avoid, and how to format answers. 80 to 250 words. Do not mention that you are writing a prompt.\n\nReply in exactly this shape:\nNAME: <a 2 to 4 word title>\n\n<the system prompt>";
+
+/// Ask the chat model to draft a system prompt from a description, like
+/// "a patient Rust tutor". Returns its name and text.
+pub fn write_system_prompt(secrets: &Secrets, provider: &Provider, model: &str, description: &str) -> Result<(String, String)> {
+    let request = vec![
+        json!({"role": "system", "content": PROMPT_WRITER}),
+        json!({"role": "user", "content": description}),
+    ];
+    let reply = api::complete(provider, secrets, model, &request, &json!({"temperature": 0.7, "maxTokens": 700}))?;
+    parse_written_prompt(&reply.content, description)
+}
+
+/// "NAME: Rust Tutor\n\nYou are…" → ("Rust Tutor", "You are…").
+fn parse_written_prompt(raw: &str, description: &str) -> Result<(String, String)> {
+    let (_, answer) = split_reasoning(raw);
+    let text = answer.trim();
+    let named = text.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("NAME:"));
+    let (name, body) = if named {
+        let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+        (first[5..].to_string(), rest.trim().to_string())
+    } else {
+        (description.to_string(), text.to_string())
+    };
+    let name: String = name.chars().filter(|c| !"*\"`".contains(*c)).collect::<String>().trim().chars().take(40).collect();
+    if body.is_empty() {
+        anyhow::bail!("The model did not write a prompt. Try a more specific description.");
+    }
+    Ok((if name.is_empty() { "New prompt".into() } else { name }, body))
+}
+
 pub fn split_reasoning(content: &str) -> (String, String) {
     let mut reasoning = String::new();
     let mut answer = String::new();
@@ -152,6 +201,8 @@ pub fn system_prompt(db: &Database, chat: &Chat, model: &str) -> String {
         .or_else(|| settings.get("defaultPromptId").and_then(Value::as_str).map(str::to_owned));
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut sections: Vec<String> = Vec::new();
+    let provider = chat.provider_id.as_deref().and_then(|id| db.provider(id).ok().flatten());
+    sections.push(identity(model, provider.as_ref().map(|p| p.name.as_str())));
     if let Some(prompt) = prompt_id.and_then(|id| prompts.into_iter().find(|p| p.id == id)) {
         sections.push(prompt.body.replace("{model}", model).replace("{date}", &today));
     }
@@ -189,14 +240,19 @@ pub fn system_prompt(db: &Database, chat: &Chat, model: &str) -> String {
         }
         sections.push(text);
     }
-    let automatic: Vec<_> = skills.iter().filter(|skill| skill.mode == "auto").collect();
+    let automatic: Vec<(String, String)> = skills
+        .iter()
+        .filter(|skill| skill.mode == "auto")
+        .map(|skill| (skill.name.clone(), skill.description.clone()))
+        .chain(crate::skills::active_globals(&db.skills().unwrap_or_default()).into_iter().map(|g| (g.name, g.description)))
+        .collect();
     if !automatic.is_empty() {
         let mut text = String::from(
             "Available skills are task-specific instructions. When one matches the user's request, call use_skill with its exact name, then follow the returned instructions. Do not load unrelated skills.",
         );
-        for skill in automatic {
-            let description: String = skill.description.replace('\n', " ").chars().take(280).collect();
-            text.push_str(&format!("\n- {}: {}", skill.name, description));
+        for (name, description) in automatic {
+            let description: String = description.replace('\n', " ").chars().take(280).collect();
+            text.push_str(&format!("\n- {name}: {description}"));
         }
         sections.push(text);
     }
@@ -288,16 +344,20 @@ pub fn run_turn(
             definitions.push(crate::memory::tool_definition());
         }
         let skills = db.skills().unwrap_or_default();
-        let auto_skills: Vec<_> = skills
+        let globals = crate::skills::active_globals(&skills);
+        let auto_skills: Vec<String> = skills
             .iter()
             .filter(|skill| skill.enabled && skill.mode == "auto")
+            .map(|skill| skill.name.clone())
+            .chain(globals.iter().map(|g| g.name.clone()))
             .collect();
         if !auto_skills.is_empty() {
             definitions.push(skill_tool(&auto_skills));
         }
-        if skills
-            .iter()
-            .any(|skill| skill.enabled && matches!(skill.mode.as_str(), "auto" | "always"))
+        if !globals.is_empty()
+            || skills
+                .iter()
+                .any(|skill| skill.enabled && matches!(skill.mode.as_str(), "auto" | "always"))
         {
             definitions.push(skill_file_tool());
         }
@@ -449,8 +509,7 @@ fn presearch(ctx: &Context, db: &Database, messages: &mut Vec<Value>, sink: &mut
     Ok(())
 }
 
-fn skill_tool(skills: &[&crate::models::Skill]) -> Value {
-    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+fn skill_tool(names: &[String]) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -540,14 +599,18 @@ fn run_tool(
         crate::memory::TOOL_NAME => crate::memory::apply(db, chat, &args.to_string()).map_err(|e| e.to_string()),
         "use_skill" => {
             let wanted = args.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            db.skills()
-                .ok()
-                .and_then(|skills| {
-                    skills.into_iter().find(|skill| {
-                        skill.enabled && skill.mode == "auto" && skill.name.eq_ignore_ascii_case(&wanted)
-                    })
-                })
+            let library = db.skills().unwrap_or_default();
+            library
+                .iter()
+                .find(|skill| skill.enabled && skill.mode == "auto" && skill.name.eq_ignore_ascii_case(&wanted))
                 .map(|skill| skill.body.chars().take(60_000).collect())
+                .or_else(|| {
+                    // A skill another agent installed: its files are read from its folder.
+                    crate::skills::active_globals(&library)
+                        .into_iter()
+                        .find(|g| g.name.eq_ignore_ascii_case(&wanted))
+                        .map(|g| format!("{}\n\n(This skill's files are in {}; read them with read_skill_file.)", g.body.chars().take(60_000).collect::<String>(), g.place))
+                })
                 .ok_or_else(|| format!("No enabled skill named {wanted:?}."))
         }
         "read_skill_file" => read_skill_file(db, &args),
@@ -646,7 +709,18 @@ fn read_skill_file(db: &Database, args: &Value) -> Result<String, String> {
                     && skill.name.eq_ignore_ascii_case(wanted)
             })
         })
-        .ok_or_else(|| format!("No enabled skill named {wanted:?}."))?;
+        .ok_or_else(|| format!("No enabled skill named {wanted:?}."));
+    let skill = match skill {
+        Ok(skill) => skill,
+        Err(missing) => {
+            let library = db.skills().unwrap_or_default();
+            let global = crate::skills::active_globals(&library)
+                .into_iter()
+                .find(|g| g.name.eq_ignore_ascii_case(wanted))
+                .ok_or(missing)?;
+            return crate::skills::global_file(&global, &path).map_err(|e| e.to_string());
+        }
+    };
     db.conn
         .query_row(
             "SELECT content FROM skill_files WHERE skill_id=?1 AND path=?2",
@@ -708,6 +782,16 @@ mod tests {
         let (reasoning, answer) = split_reasoning("<think>still thinking");
         assert_eq!(reasoning, "still thinking");
         assert_eq!(answer, "");
+    }
+
+    #[test]
+    fn written_prompts_are_named() {
+        let (name, body) = parse_written_prompt("<think>hm</think>NAME: **Rust Tutor**\n\nYou are a patient tutor.", "x").unwrap();
+        assert_eq!(name, "Rust Tutor");
+        assert_eq!(body, "You are a patient tutor.");
+        let (name, body) = parse_written_prompt("You are kind.", "a kind helper").unwrap();
+        assert_eq!((name.as_str(), body.as_str()), ("a kind helper", "You are kind."));
+        assert!(parse_written_prompt("NAME: Empty\n", "x").is_err());
     }
 
     #[test]

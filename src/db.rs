@@ -745,12 +745,27 @@ impl Database {
     }
 
     pub fn add_prompt(&self, name: &str, body: &str) -> Result<String> {
+        self.add_prompt_tagged(name, body, &[])
+    }
+
+    /// A new prompt with tags, such as "generated" for one the model wrote.
+    pub fn add_prompt_tagged(&self, name: &str, body: &str, tags: &[&str]) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO prompts (id,name,body,tags,favorite,tool_ids,variables,updated_at) VALUES (?1,?2,?3,'[]',0,'[]','[]',?4)",
-            params![id, name.trim(), body, now_ms()],
+            "INSERT INTO prompts (id,name,body,tags,favorite,tool_ids,variables,updated_at) VALUES (?1,?2,?3,?4,0,'[]','[]',?5)",
+            params![id, name.trim(), body, serde_json::to_string(tags)?, now_ms()],
         )?;
         Ok(id)
+    }
+
+    pub fn set_prompt_body(&self, id: &str, body: &str) -> Result<()> {
+        self.conn.execute("UPDATE prompts SET body=?2, updated_at=?3 WHERE id=?1", params![id, body, now_ms()])?;
+        Ok(())
+    }
+
+    pub fn delete_prompt(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM prompts WHERE id=?1", [id])?;
+        Ok(())
     }
 
     pub fn skills(&self) -> Result<Vec<Skill>> {
@@ -893,6 +908,15 @@ impl Database {
             params![id, name, url, transport, auth],
         )?;
         Ok(id)
+    }
+
+    /// The header a server's token goes in, and its form (`Bearer {token}`).
+    pub fn set_mcp_auth_header(&self, id: &str, header: Option<&str>, template: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mcp_servers SET auth_header=?1, auth_template=?2 WHERE id=?3",
+            params![header, template, id],
+        )?;
+        Ok(())
     }
 
     pub fn set_mcp_auth(&self, id: &str, auth: &str) -> Result<()> {
