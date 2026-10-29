@@ -13,7 +13,7 @@ apk_arch="$8"
 cross build --locked --release --target "$target"
 mkdir -p dist packaging
 cp "target/$target/release/aihat" packaging/aihat
-tar -czf "dist/UniversalMemory-linux-${linux_name}.tar.gz" -C packaging aihat
+tar -czf "dist/aihat-linux-${linux_name}.tar.gz" -C packaging aihat
 
 PACKAGE_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
@@ -24,16 +24,16 @@ export PACKAGE_VERSION NFPM_ARCH="$nfpm_arch"
 for format in $formats; do
   case "$format" in
     deb)
-      output="dist/UniversalMemory-linux-${debian_arch}.deb"
+      output="dist/aihat-debian-${debian_arch}.deb"
       ;;
     rpm)
-      output="dist/UniversalMemory-fedora-${rpm_arch}.rpm"
+      output="dist/aihat-fedora-${rpm_arch}.rpm"
       ;;
     archlinux)
-      output="dist/UniversalMemory-arch-${archlinux_arch}.pkg.tar.zst"
+      output="dist/aihat-arch-${archlinux_arch}.pkg.tar.zst"
       ;;
     apk)
-      output="dist/UniversalMemory-alpine-${apk_arch}.apk"
+      output="dist/aihat-alpine-${apk_arch}.apk"
       ;;
     *)
       echo "Unsupported package format: $format" >&2

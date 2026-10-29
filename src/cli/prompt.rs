@@ -47,15 +47,6 @@ pub fn outro() {
     eprintln!("{}", paint("└", theme().fg(Role::Dim)));
 }
 
-/// `◇ title hint` with a finished answer below it.
-pub fn answered(title: &str, hint: &str, answer: &str) {
-    let t = theme();
-    let hint = if hint.is_empty() { String::new() } else { format!(" {}", paint(&format!("({hint})"), t.fg(Role::Dim))) };
-    eprintln!("{} {title}{hint}", paint("◇", t.fg(Role::Accent)));
-    eprintln!("{} {answer}", bar(false));
-    eprintln!("{}", bar(false));
-}
-
 /// A step that runs while the user waits: `◇ Testing connection… ✓ Connected`.
 pub fn step(title: &str, result: &str, role: Role) {
     let t = theme();
@@ -101,8 +92,8 @@ impl Block {
 
 fn read_key() -> Result<KeyEvent> {
     loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Release {
+        if let Event::Key(key) = event::read()?
+            && key.kind != KeyEventKind::Release {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     let _ = terminal::disable_raw_mode();
                     let _ = execute!(out(), MoveToColumn(0));
@@ -111,7 +102,6 @@ fn read_key() -> Result<KeyEvent> {
                 }
                 return Ok(key);
             }
-        }
     }
 }
 

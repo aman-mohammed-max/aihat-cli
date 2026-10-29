@@ -8,6 +8,21 @@ use std::path::Path;
 
 const SERVICE: &str = "AI Hat";
 
+/// macOS and Windows keychains keep secrets for good. Elsewhere there is no
+/// keychain that is always there (Linux's kernel keyring forgets everything
+/// at restart; the BSDs have none in this build), so keys live in the
+/// private file.
+const KEYCHAIN_LASTS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// Where a new key is kept, for the hint next to key fields.
+pub fn where_keys_go(system: bool) -> &'static str {
+    match (KEYCHAIN_LASTS, system) {
+        (true, true) => "saved in your system keychain",
+        (true, false) => "saved in your keychain",
+        (false, _) => "saved in a private file only you can read",
+    }
+}
+
 #[derive(Clone)]
 pub struct Secrets {
     file: std::path::PathBuf,
@@ -28,20 +43,30 @@ impl Secrets {
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
-        if let Ok(value) = Entry::new(SERVICE, name).and_then(|entry| entry.get_password()) {
+        if KEYCHAIN_LASTS
+            && let Ok(value) = Entry::new(SERVICE, name).and_then(|entry| entry.get_password())
+        {
             return Some(value);
         }
-        self.read_file()
-            .get(name)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+        if let Some(value) = self.read_file().get(name).and_then(Value::as_str) {
+            return Some(value.to_owned());
+        }
+        // Older builds put Linux keys in the kernel keyring; move one over
+        // while it is still there.
+        let entry = Entry::new(SERVICE, name).ok()?;
+        let value = entry.get_password().ok()?;
+        if self.set(name, &value).is_ok() {
+            let _ = entry.delete_credential();
+        }
+        Some(value)
     }
 
     pub fn set(&self, name: &str, value: &str) -> Result<&'static str> {
-        if let Ok(entry) = Entry::new(SERVICE, name) {
-            if entry.set_password(value).is_ok() {
-                return Ok("system credential store");
-            }
+        if KEYCHAIN_LASTS
+            && let Ok(entry) = Entry::new(SERVICE, name)
+            && entry.set_password(value).is_ok()
+        {
+            return Ok("system credential store");
         }
         let mut all = self.read_file().as_object().cloned().unwrap_or_default();
         all.insert(name.to_string(), Value::String(value.to_string()));
@@ -80,9 +105,10 @@ impl Secrets {
     /// (it asks the keychain), so callers should cache the answer.
     pub fn provider_key_location(&self, provider_id: &str) -> Option<&'static str> {
         let name = format!("apikey.{provider_id}");
-        if Entry::new(SERVICE, &name)
-            .and_then(|entry| entry.get_password())
-            .is_ok()
+        if KEYCHAIN_LASTS
+            && Entry::new(SERVICE, &name)
+                .and_then(|entry| entry.get_password())
+                .is_ok()
         {
             return Some("keychain");
         }

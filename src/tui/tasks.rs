@@ -3,23 +3,23 @@
 use crate::db::Database;
 use crate::engine;
 use crate::models::Provider;
+use crate::ui::picture::Picture;
 use base64::Engine;
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Improve the prompt with the chat model (unless `raw`), then draw it.
+/// Nothing is saved here: the person chooses where in the picture dialog.
 pub fn draw_image(
     ctx: &engine::Context,
     selection: Option<(Provider, String)>,
     prompt: &str,
     raw: bool,
-    downloads: &Path,
-) -> Result<(Vec<PathBuf>, String), String> {
+) -> Result<super::images::Drawn, String> {
     let mut used = prompt.to_string();
-    if !raw {
-        if let Some((provider, model)) = &selection {
+    if !raw
+        && let Some((provider, model)) = &selection {
             let request = vec![
                 json!({"role": "system", "content": "You write prompts for image models. Rewrite the idea as one vivid, specific image prompt under 80 words: subject, setting, style, lighting, composition. Reply with the prompt only."}),
                 json!({"role": "user", "content": prompt}),
@@ -31,40 +31,34 @@ pub fn draw_image(
                 }
             }
         }
-    }
     let db = Database::open(&ctx.db_path).map_err(|e| e.to_string())?;
-    let images = crate::imagegen::generate(&db, &ctx.secrets, &used, None, None, None).map_err(|e| format!("{e:#}"))?;
+    let images = crate::imagegen::generate(&db, &ctx.secrets, &used, None, None, None).map_err(|e| crate::tui::app::describe_error(&e))?;
     if images.is_empty() {
         return Err("the image service returned no pictures".into());
     }
-    std::fs::create_dir_all(downloads).map_err(|e| e.to_string())?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let mut files = Vec::new();
-    for (index, image) in images.iter().enumerate() {
-        let bytes = image_bytes(image)?;
-        let path = downloads.join(format!("aihat-{stamp}-{}.png", index + 1));
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        files.push(path);
-    }
-    Ok((files, used))
+    let pictures = images
+        .iter()
+        .map(|image| crate::imagegen::picture_bytes(image).and_then(Picture::decode).map_err(|e| format!("{e:#}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(super::images::Drawn {
+        pictures,
+        used,
+        label: crate::imagegen::engine_label(&db),
+    })
 }
 
-fn image_bytes(image: &Value) -> Result<Vec<u8>, String> {
-    if let Some(data) = image.get("b64_json").and_then(Value::as_str) {
-        let data = data.split_once("base64,").map(|(_, rest)| rest).unwrap_or(data);
-        return base64::engine::general_purpose::STANDARD
-            .decode(data.trim())
-            .map_err(|e| format!("could not decode the image: {e}"));
-    }
-    if let Some(url) = image.get("url").and_then(Value::as_str) {
-        let response = crate::api::client(120_000)
-            .map_err(|e| e.to_string())?
-            .get(url)
-            .send()
-            .map_err(|e| e.to_string())?;
-        return response.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string());
-    }
-    Err("the image service returned no image data".into())
+/// Put a picture on the system clipboard as an image.
+pub fn copy_image(picture: &Picture) -> Result<(), String> {
+    let rgba = picture.image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: rgba.into_raw().into(),
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Copy to the system clipboard; over SSH or without a display, fall back to
@@ -74,13 +68,11 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     // clipboard object stays alive for the whole session.
     static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
     let slot = CLIPBOARD.get_or_init(|| Mutex::new(arboard::Clipboard::new().ok()));
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(clipboard) = guard.as_mut() {
-            if clipboard.set_text(text.to_string()).is_ok() {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(clipboard) = guard.as_mut()
+            && clipboard.set_text(text.to_string()).is_ok() {
                 return Ok(());
             }
-        }
-    }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut stdout = std::io::stdout();
     write!(stdout, "\x1b]52;c;{encoded}\x07").map_err(|e| e.to_string())?;

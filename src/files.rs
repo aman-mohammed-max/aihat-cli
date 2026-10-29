@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use crate::api::SendRetry;
 use base64::Engine;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -90,11 +91,12 @@ pub fn read_url(address: &str) -> Result<Attachment> {
         .filter(|name| !name.is_empty())
         .unwrap_or(url.host_str().unwrap_or("web page"))
         .to_string();
+    crate::api::tls_ready();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(concat!("AI-Hat-CLI/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let response = client.get(url.clone()).send()?.error_for_status()?;
+    let response = client.get(url.clone()).send_retry()?.error_for_status()?;
     if response
         .content_length()
         .is_some_and(|length| length > 50 * 1024 * 1024)

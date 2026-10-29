@@ -18,7 +18,42 @@ struct McpSession {
     protocol_version: String,
 }
 
+/// Send, and try again when the connection itself fails: some networks reset
+/// a share of new connections, and nothing reached the server in that case,
+/// so sending again is safe. Four tries in all, about two seconds at most.
+pub trait SendRetry {
+    fn send_retry(self) -> reqwest::Result<reqwest::blocking::Response>;
+}
+
+impl SendRetry for reqwest::blocking::RequestBuilder {
+    fn send_retry(self) -> reqwest::Result<reqwest::blocking::Response> {
+        let mut wait = 200;
+        for _ in 0..3 {
+            let Some(attempt) = self.try_clone() else {
+                break;
+            };
+            match attempt.send() {
+                Err(error) if error.is_connect() => {
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    wait *= 2;
+                }
+                other => return other,
+            }
+        }
+        self.send()
+    }
+}
+
+/// Choose the TLS crypto library (ring) once, before any client is built.
+pub fn tls_ready() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub fn client(timeout_ms: u64) -> Result<Client> {
+    tls_ready();
     Ok(Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms.max(1000)))
         .user_agent(concat!("AI-Hat-CLI/", env!("CARGO_PKG_VERSION")))
@@ -36,7 +71,7 @@ pub fn list_models(provider: &Provider, secrets: &Secrets) -> Result<(Vec<Value>
     let response = client
         .get(endpoint(provider, models_path))
         .headers(headers(provider, secrets)?)
-        .send()
+        .send_retry()
         .map_err(|error| request_error(provider, error))?;
     let value = checked_json(response)?;
     let rows = value
@@ -50,11 +85,10 @@ pub fn list_models(provider: &Provider, secrets: &Secrets) -> Result<(Vec<Value>
         .filter_map(|item| match item {
             Value::String(id) => Some(json!({"id": id})),
             Value::Object(mut map) => {
-                if map.get("id").is_none() {
-                    if let Some(name) = map.get("name").cloned() {
+                if map.get("id").is_none()
+                    && let Some(name) = map.get("name").cloned() {
                         map.insert("id".into(), name);
                     }
-                }
                 if map.get("id").and_then(Value::as_str).is_some() {
                     Some(Value::Object(map))
                 } else {
@@ -124,7 +158,7 @@ pub fn chat(
         .post(endpoint(provider, "chat/completions"))
         .headers(headers(provider, secrets)?)
         .json(&body)
-        .send()
+        .send_retry()
         .map_err(|error| request_error(provider, error))?;
     let response = ensure_success(response)?;
     let mut reply = StreamedReply::default();
@@ -321,7 +355,8 @@ pub fn image_generation_sized(
         .post(endpoint(provider, "images/generations"))
         .headers(headers(provider, secrets)?)
         .json(&body)
-        .send()?;
+        .send_retry()
+        .map_err(|error| request_error(provider, error))?;
     let value = checked_json(response)?;
     Ok(value
         .get("data")
@@ -353,7 +388,7 @@ pub fn image_a1111(
     let response = client(240_000)?
         .post(format!("{}/sdapi/v1/txt2img", url.trim_end_matches('/')))
         .json(&body)
-        .send()
+        .send_retry()
         .context("connecting to Automatic1111")?;
     let value = checked_json(response)?;
     Ok(value
@@ -396,7 +431,7 @@ pub fn image_comfy(
     let submit = client
         .post(format!("{base}/prompt"))
         .json(&json!({"prompt":workflow}))
-        .send()
+        .send_retry()
         .context("connecting to ComfyUI")?;
     let submitted: Value = checked_json(submit).context("submitting the ComfyUI workflow")?;
     let prompt_id = submitted
@@ -407,7 +442,7 @@ pub fn image_comfy(
         std::thread::sleep(std::time::Duration::from_secs(1));
         let history_response = client
             .get(format!("{base}/history/{}", urlencoding::encode(prompt_id)))
-            .send();
+            .send_retry();
         let Ok(response) = history_response else {
             continue;
         };
@@ -460,7 +495,7 @@ pub fn image_comfy(
             );
             let response = client
                 .get(address)
-                .send()
+                .send_retry()
                 .context("downloading a ComfyUI image")?;
             let bytes = checked_bytes(response)?;
             result.push(json!({"b64_json":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}));
@@ -477,7 +512,7 @@ pub fn search_searxng_safe(url: &str, query: &str, count: usize, safe: bool) -> 
         urlencoding::encode(query),
         if safe { 1 } else { 0 }
     );
-    let response = client(15_000)?.get(address).send()?;
+    let response = client(15_000)?.get(address).send_retry()?;
     let value = checked_json(response)?;
     Ok(value
         .get("results")
@@ -511,7 +546,7 @@ pub fn search_provider(
         .post(endpoint(provider, "search"))
         .headers(headers(provider, secrets)?)
         .json(&body)
-        .send()
+        .send_retry()
         .context("connecting to the web search provider")?;
     checked_json(response)
 }
@@ -545,7 +580,7 @@ pub fn search_google_grounded(
         .post(endpoint(provider, "chat/completions"))
         .headers(headers(provider, secrets)?)
         .json(&body)
-        .send()
+        .send_retry()
         .context("connecting to FreeLLMAPI Google Search grounding")?;
     checked_json(response)
 }
@@ -562,7 +597,7 @@ pub fn search_brave(query: &str, count: usize, safe: bool, key: &str) -> Result<
         .get(address)
         .header("X-Subscription-Token", token)
         .header(ACCEPT, "application/json")
-        .send()
+        .send_retry()
         .context("connecting to Brave Search")?;
     checked_json(response)
 }
@@ -577,14 +612,16 @@ pub fn search_tavily(query: &str, count: usize, key: &str) -> Result<Value> {
         .post("https://api.tavily.com/search")
         .headers(request_headers)
         .json(&json!({"query":query,"max_results":count}))
-        .send()
+        .send_retry()
         .context("connecting to Tavily Search")?;
     checked_json(response)
 }
 
+/// One JSON-RPC request to a remote MCP server. `token` is the access token
+/// or sign-in token to send, if any.
 pub fn mcp_rpc(
     server: &crate::models::McpServer,
-    secrets: &Secrets,
+    token: Option<&str>,
     method: &str,
     params: Value,
     id: u64,
@@ -596,11 +633,11 @@ pub fn mcp_rpc(
         ACCEPT,
         HeaderValue::from_static("application/json, text/event-stream"),
     );
-    if let Some(token) = secrets.mcp_token(&server.id) {
+    if let Some(token) = token {
         let header = server.auth_header.as_deref().unwrap_or("Authorization");
         let key = HeaderName::from_bytes(header.as_bytes()).context("invalid MCP auth header")?;
         let template = server.auth_template.as_deref().unwrap_or("Bearer {token}");
-        let value = template.replace("{token}", &token);
+        let value = template.replace("{token}", token);
         headers.insert(
             key,
             HeaderValue::from_str(&value).context("invalid MCP auth value")?,
@@ -631,7 +668,7 @@ pub fn mcp_rpc(
         .json(&json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params
         }))
-        .send()
+        .send_retry()
         .context("calling MCP server")?;
     let response_session = response
         .headers()
@@ -672,8 +709,8 @@ pub fn mcp_rpc(
             .map(|session| session.protocol_version)
             .unwrap_or_else(|| "2025-03-26".into())
     };
-    if method == "initialize" || response_session.is_some() {
-        if let Ok(mut sessions) = MCP_SESSIONS
+    if (method == "initialize" || response_session.is_some())
+        && let Ok(mut sessions) = MCP_SESSIONS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
         {
@@ -688,13 +725,12 @@ pub fn mcp_rpc(
                 },
             );
         }
-    }
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
 pub fn mcp_notify(
     server: &crate::models::McpServer,
-    secrets: &Secrets,
+    token: Option<&str>,
     method: &str,
     params: Value,
 ) -> Result<()> {
@@ -705,13 +741,13 @@ pub fn mcp_notify(
         ACCEPT,
         HeaderValue::from_static("application/json, text/event-stream"),
     );
-    if let Some(token) = secrets.mcp_token(&server.id) {
+    if let Some(token) = token {
         let header = server.auth_header.as_deref().unwrap_or("Authorization");
         let key = HeaderName::from_bytes(header.as_bytes()).context("invalid MCP auth header")?;
         let template = server.auth_template.as_deref().unwrap_or("Bearer {token}");
         headers.insert(
             key,
-            HeaderValue::from_str(&template.replace("{token}", &token))
+            HeaderValue::from_str(&template.replace("{token}", token))
                 .context("invalid MCP auth value")?,
         );
     }
@@ -738,7 +774,7 @@ pub fn mcp_notify(
         .json(&json!({
             "jsonrpc": "2.0", "method": method, "params": params
         }))
-        .send()?;
+        .send_retry()?;
     ensure_success(response)?;
     Ok(())
 }
@@ -834,15 +870,6 @@ impl ApiError {
         }
     }
 
-    /// A short label for lists: "401", "offline", "timed out".
-    pub fn short(&self) -> String {
-        match (self.kind, self.status) {
-            (ErrorKind::Unreachable, _) if self.detail.contains("timed out") => "timed out".into(),
-            (ErrorKind::Unreachable, _) => "offline".into(),
-            (_, Some(status)) => status.to_string(),
-            _ => "failed".into(),
-        }
-    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -871,9 +898,18 @@ pub fn request_error(provider: &Provider, error: reqwest::Error) -> anyhow::Erro
     let detail = if error.is_timeout() {
         format!("No answer after {seconds}s (timed out).")
     } else if error.is_connect() {
-        let text = format!("{error:#}").to_lowercase();
+        let mut text = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            text.push(' ');
+            text.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        let text = text.to_lowercase();
         if text.contains("refused") {
             "Connection refused.".to_string()
+        } else if text.contains("reset") {
+            "The connection was reset, four times in a row.".to_string()
         } else if text.contains("dns") || text.contains("resolve") || text.contains("name") {
             "The host name could not be resolved.".to_string()
         } else {

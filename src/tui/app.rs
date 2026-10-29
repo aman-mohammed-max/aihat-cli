@@ -3,6 +3,7 @@
 use super::composer::Composer;
 use super::dialogs::{self, Dialog};
 use super::files::FileIndex;
+use super::keys::{self, Action};
 use super::providers::ProvidersPage;
 use super::transcript::{self, Layout};
 use crate::config::{AppConfig, Paths};
@@ -33,6 +34,8 @@ pub enum TurnEvent {
     ToolStarted(ToolLabel),
     ToolFinished(Value),
     Warning(String),
+    /// An MCP server needs a sign-in; the browser is open.
+    SigningIn(String),
     Approval(Approval, Sender<Decision>),
     Done(Result<TurnOutput, String>),
 }
@@ -57,12 +60,28 @@ pub enum Task {
     Image {
         chat_id: String,
         prompt: String,
-        result: Result<(Vec<std::path::PathBuf>, String), String>,
+        result: Result<super::images::Drawn, String>,
         ms: u64,
     },
     McpRefreshed {
         name: String,
         result: Result<usize, String>,
+    },
+    /// The browser was opened for a server's sign-in.
+    McpSigningIn {
+        name: String,
+    },
+    /// Memory changed after a reply: "Saved to memory: …".
+    MemoryNote(String),
+    /// A skill read from its folder or GitHub: new, or `existing` again.
+    SkillLoaded {
+        existing: Option<String>,
+        result: Result<crate::skills::Loaded, String>,
+    },
+    /// The server wants an access token pasted.
+    McpNeedsToken {
+        id: String,
+        name: String,
     },
     Shell {
         command: String,
@@ -95,6 +114,8 @@ pub struct ActiveTurn {
     pub cancel: Arc<AtomicBool>,
     pub approval: Option<PendingApproval>,
     pub editing_args: bool,
+    /// Waiting for a browser sign-in to this MCP server, since when.
+    pub signing_in: Option<(String, Instant)>,
 }
 
 pub struct Notice {
@@ -152,6 +173,16 @@ pub struct App {
     pub width: u16,
     pub busy_task: Option<String>,
     pub form_token: u64,
+    /// The idea being drawn by /image, and when it started.
+    pub drawing: Option<(String, Instant)>,
+    /// A finished picture waiting for the open dialog to close.
+    pub pending_image: Option<Box<super::images::ImageViewer>>,
+    /// /settings: the event loop hands the terminal to an editor.
+    pub edit_settings: bool,
+    /// Where "Jump to bottom" was drawn, for clicks.
+    pub jump_button: Option<ratatui::layout::Rect>,
+    /// Stops a browser sign-in that is waiting.
+    pub sign_in_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl App {
@@ -206,6 +237,11 @@ impl App {
             files: FileIndex::default(),
             width: 80,
             busy_task: None,
+            drawing: None,
+            pending_image: None,
+            edit_settings: false,
+            jump_button: None,
+            sign_in_cancel: None,
             form_token: 0,
         };
         if let Some(id) = initial_chat {
@@ -284,7 +320,7 @@ impl App {
 
     pub fn new_chat(&mut self) {
         if self.turn.is_some() {
-            self.notify(Role::Warn, "A reply is still streaming · esc to stop it first");
+            self.notify(Role::Warn, format!("A reply is still streaming · {} to stop it first", keys::label(Action::Stop)));
             return;
         }
         self.chat = None;
@@ -357,7 +393,7 @@ impl App {
             return;
         }
         if self.turn.is_some() && !trimmed.starts_with('/') {
-            self.notify(Role::Warn, "A reply is still streaming · esc to stop it");
+            self.notify(Role::Warn, format!("A reply is still streaming · {} to stop it", keys::label(Action::Stop)));
             return;
         }
         self.remember(trimmed);
@@ -447,6 +483,7 @@ impl App {
             cancel: cancel.clone(),
             approval: None,
             editing_args: false,
+            signing_in: None,
         });
         let ctx = self.ctx.clone();
         let tx = self.tx.clone();
@@ -458,8 +495,17 @@ impl App {
                     tx: tx.clone(),
                     cancel: cancel.clone(),
                 };
+                let (chat, provider, model) = (spec.chat.clone(), spec.provider.clone(), spec.model.clone());
+                let asked = engine::last_user_text(&spec.messages);
                 let result = engine::run_turn(&ctx, spec, &cancel, &mut sink).map_err(|error| describe_error(&error));
+                let answer = result.as_ref().ok().filter(|o| !o.cancelled).map(|o| o.content.clone());
                 let _ = tx.send(WorkerMsg::Turn(id, TurnEvent::Done(result)));
+                // Models without tools learn memories after the reply, as in the app.
+                if let (Some(answer), Ok(db)) = (answer, crate::db::Database::open(&ctx.db_path))
+                    && let Some(note) = crate::memory::learn_from_turn(&db, &ctx.secrets, &chat, &provider, &model, &asked, &answer)
+                {
+                    let _ = tx.send(WorkerMsg::Task(Task::MemoryNote(note)));
+                }
             })
             .ok();
     }
@@ -520,6 +566,10 @@ impl App {
             }
             return;
         };
+        // Anything else arriving means the sign-in is over.
+        if !matches!(event, TurnEvent::SigningIn(_)) {
+            turn.signing_in = None;
+        }
         match event {
             TurnEvent::Reasoning(delta) => turn.reasoning.push_str(&delta),
             TurnEvent::Text(delta) => {
@@ -530,6 +580,10 @@ impl App {
             }
             TurnEvent::ToolStarted(label) => turn.tools.push((label, Instant::now(), None)),
             TurnEvent::ToolFinished(log) => {
+                // "Saved “Rust at work”." from the memory tool, shown like the app's note.
+                let memory_note = (log["name"].as_str() == Some(crate::memory::TOOL_NAME))
+                    .then(|| log["result"].as_str().unwrap_or("").to_string())
+                    .filter(|r| ["Saved", "Updated", "Deleted"].iter().any(|w| r.starts_with(w)));
                 if let Some(slot) = turn.tools.iter_mut().rev().find(|(_, _, done)| done.is_none()) {
                     slot.2 = Some(log);
                 } else {
@@ -539,6 +593,14 @@ impl App {
                     };
                     turn.tools.push((label, Instant::now(), Some(log)));
                 }
+                if let Some(note) = memory_note {
+                    let note = note.replace("Saved", "Saved to memory:").replace("Updated", "Memory updated:").replace("Deleted", "Forgot");
+                    self.notify(Role::Accent, format!("◇ {}", note.trim_end_matches('.')));
+                }
+            }
+            TurnEvent::SigningIn(server) => {
+                turn.signing_in = Some((server.clone(), Instant::now()));
+                self.notify(Role::Accent, format!("Sign in to {server} in your browser · esc cancels"));
             }
             TurnEvent::Warning(text) => {
                 let line = Line::from(vec![
@@ -742,8 +804,9 @@ impl App {
             "rename" => self.rename(args),
             "copy" => self.copy_last_reply(),
             "clear" => self.clear_screen(),
-            "memory" => self.toggle_memory(),
+            "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
+            "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
             "" => {}
             other => self.fail(format!("Unknown command /{other} · type / to see them all")),
@@ -783,7 +846,7 @@ impl App {
             .cloned();
         match found {
             Some(model) => self.apply_model(&model.provider_id, &model.id, false),
-            None => self.fail(format!("No model matches {query:?} · ctrl+p lists them")),
+            None => self.fail(format!("No model matches {query:?} · {} lists them", keys::label(Action::SwitchModel))),
         }
     }
 
@@ -851,7 +914,7 @@ impl App {
             .find(|prompt| prompt.name.to_lowercase().contains(&wanted));
         match found {
             Some(prompt) => self.apply_prompt(Some(prompt.id), false),
-            None => self.fail(format!("No system prompt matches {query:?} · ctrl+s lists them")),
+            None => self.fail(format!("No system prompt matches {query:?} · {} lists them", keys::label(Action::SwitchPrompt))),
         }
     }
 
@@ -1025,14 +1088,15 @@ impl App {
         }
         self.reload_messages();
         self.busy_task = Some("drawing".into());
+        self.drawing = Some((prompt.clone(), Instant::now()));
+        self.scroll = 0;
         let selection = self.current_selection();
         let ctx = self.ctx.clone();
-        let downloads = self.paths.downloads_dir.clone();
         let tx = self.tx.clone();
         let chat_id = chat.id.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let result = super::tasks::draw_image(&ctx, selection, &prompt, raw, &downloads);
+            let result = super::tasks::draw_image(&ctx, selection, &prompt, raw);
             let _ = tx.send(WorkerMsg::Task(Task::Image {
                 chat_id,
                 prompt,
@@ -1040,6 +1104,54 @@ impl App {
                 ms: started.elapsed().as_millis() as u64,
             }));
         });
+    }
+
+    /// The picture dialog is done: record the reply, with the saved files.
+    pub fn finish_image(&mut self, chat_id: &str, prompt: &str, used: &str, saved: &[std::path::PathBuf], ms: u64) {
+        let attachments: Vec<Value> = saved
+            .iter()
+            .map(|path| {
+                json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "kind": "image",
+                    "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    "uri": path.display().to_string(),
+                })
+            })
+            .collect();
+        let mut content = if used.trim() == prompt.trim() { String::new() } else { format!("Prompt used: {used}") };
+        if saved.is_empty() {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str("Picture not saved.");
+        }
+        let _ = self.db.save_message(chat_id, "assistant", &content, None, Some(ms), &json!(attachments), &json!([]), &json!([]));
+        self.reload_messages();
+        self.scroll = 0;
+    }
+
+    /// After /settings: use what can change while running; colours, ascii
+    /// boxes and keys are read at start.
+    pub fn reload_settings(&mut self) {
+        match AppConfig::load(&self.paths) {
+            Ok(config) => {
+                let restart = config.accent != self.config.accent
+                    || config.colors != self.config.colors
+                    || config.ascii != self.config.ascii
+                    || serde_json::to_value(&config.keys).ok() != serde_json::to_value(&self.config.keys).ok();
+                self.show_reasoning = config.show_reasoning;
+                self.ctx.config = config.clone();
+                self.config = config;
+                self.cache.clear();
+                if restart {
+                    self.notify(Role::Accent, "Saved settings.json · restart aihat for the new colours and keys");
+                } else {
+                    self.ok("Saved settings.json");
+                }
+            }
+            Err(error) => self.fail(format!("{error} · /settings to fix it")),
+        }
     }
 
     pub fn refresh_models(&mut self, provider: Option<String>) {
@@ -1093,10 +1205,10 @@ impl App {
         self.clear_before = Some(chrono::Utc::now().timestamp_millis());
         self.local.clear();
         self.scroll = 0;
-        self.notify(Role::Dim, "Screen cleared · the chat is still saved · ctrl+r to reopen it");
+        self.notify(Role::Dim, format!("Screen cleared · the chat is still saved · {} to reopen it", keys::label(Action::PastChats)));
     }
 
-    fn toggle_memory(&mut self) {
+    pub fn toggle_memory(&mut self) {
         let Some(chat) = self.chat.clone() else {
             self.notify(Role::Warn, "Start the chat first, then change its memory");
             return;
@@ -1141,11 +1253,10 @@ impl App {
                 }
             }
             Task::FormTested { token, result } => {
-                if let Some(Dialog::Form(form)) = self.dialog.as_mut() {
-                    if form.token == token {
+                if let Some(Dialog::Form(form)) = self.dialog.as_mut()
+                    && form.token == token {
                         form.set_test_result(result);
                     }
-                }
             }
             Task::ModelsRefreshed { label, result } => match result {
                 Ok(summary) => {
@@ -1170,38 +1281,59 @@ impl App {
                 Err(error) => self.fail(format!("Could not compact: {error}")),
             },
             Task::Image { chat_id, prompt, result, ms } => {
-                let (content, attachments) = match result {
-                    Ok((files, used)) => {
-                        let attachments: Vec<Value> = files
-                            .iter()
-                            .map(|path| {
-                                json!({
-                                    "id": uuid::Uuid::new_v4().to_string(),
-                                    "kind": "image",
-                                    "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                                    "uri": path.display().to_string(),
-                                })
-                            })
-                            .collect();
-                        let content = if used.trim() == prompt.trim() {
-                            String::new()
+                self.drawing = None;
+                match result {
+                    Ok(drawn) => {
+                        let viewer = Box::new(super::images::ImageViewer::new(chat_id, prompt, drawn, ms));
+                        if self.dialog.is_none() {
+                            self.dialog = Some(Dialog::Image(viewer));
                         } else {
-                            format!("Prompt used: {used}")
-                        };
-                        (content, json!(attachments))
+                            self.pending_image = Some(viewer);
+                            self.notify(Role::Accent, "Your picture is ready · it opens when you close this");
+                        }
                     }
-                    Err(error) => {
-                        self.chat_error(&format!("Image failed: {error}"));
-                        return;
-                    }
-                };
-                let _ = self.db.save_message(&chat_id, "assistant", &content, None, Some(ms), &attachments, &json!([]), &json!([]));
-                self.reload_messages();
+                    Err(error) => self.chat_error(&format!("Image failed: {error}")),
+                }
             }
-            Task::McpRefreshed { name, result } => match result {
-                Ok(count) => self.ok(format!("{name}: {} ready", text::plural(count, "tool", "tools"))),
-                Err(error) => self.fail(format!("{name}: {error}")),
+            Task::McpRefreshed { name, result } => {
+                self.sign_in_cancel = None;
+                match result {
+                    Ok(count) => self.ok(format!("{name}: {} ready", text::plural(count, "tool", "tools"))),
+                    Err(error) => self.fail(format!("{name}: {error}")),
+                }
+            }
+            Task::MemoryNote(note) => self.notify(Role::Accent, format!("◇ {note}")),
+            Task::SkillLoaded { existing, result } => match result {
+                Ok((name, description, body, source, files)) => {
+                    let saved = match &existing {
+                        Some(id) => self.db.update_skill_source_with_files(id, &name, &description, &body, &source, &files).map(|_| id.clone()),
+                        None if self.db.skills().unwrap_or_default().iter().any(|s| s.name.eq_ignore_ascii_case(&name)) => {
+                            Err(anyhow::anyhow!("there is already a skill named {name}; r reads it again"))
+                        }
+                        None => self.db.save_skill_with_files(&name, &description, &body, &source, &files),
+                    };
+                    match saved {
+                        Ok(id) => {
+                            if existing.is_none() && crate::skills::is_github(&source) {
+                                let _ = self.db.set_skill_auto_update(&id, true);
+                            }
+                            let files = if files.is_empty() { String::new() } else { format!(" · {}", text::plural(files.len(), "file", "files")) };
+                            self.ok(format!("{} {name}{files}", if existing.is_some() { "Updated" } else { "Added" }));
+                        }
+                        Err(error) => self.fail(format!("Could not save {name}: {error}")),
+                    }
+                }
+                Err(error) => self.fail(format!("Could not read the skill: {error}")),
             },
+            Task::McpSigningIn { name } => {
+                self.busy_task = Some(format!("waiting for you to sign in to {name}"));
+                self.notify(Role::Accent, format!("Sign in to {name} in your browser · esc cancels"));
+            }
+            Task::McpNeedsToken { id, name } => {
+                self.sign_in_cancel = None;
+                self.dialog = Some(Dialog::Form(dialogs::Form::mcp_token(&id, &name)));
+                self.notify(Role::Warn, format!("{name} needs an access token"));
+            }
             Task::Shell { command, result } => {
                 let t = theme();
                 match result {
@@ -1263,12 +1395,44 @@ impl App {
         }
     }
 
+    /// The wheel scrolls the chat (or moves through an open list); a click
+    /// on "Jump to bottom" goes back to the newest message. Returns whether
+    /// anything changed.
+    pub fn on_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let arrow = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = mouse.kind == MouseEventKind::ScrollUp;
+                if self.dialog.is_some() || matches!(self.page, Page::Providers(_)) {
+                    self.on_key(arrow(if up { KeyCode::Up } else { KeyCode::Down }));
+                } else if up {
+                    self.scroll = self.scroll.saturating_add(3);
+                } else {
+                    self.scroll = self.scroll.saturating_sub(3);
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self.jump_button.is_some_and(|button| {
+                    mouse.row == button.y && mouse.column >= button.x && mouse.column < button.x + button.width
+                });
+                if hit && self.dialog.is_none() {
+                    self.scroll = 0;
+                }
+                hit
+            }
+            _ => false,
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+        // ctrl+c always works, whatever quit is bound to.
+        if (ctrl && key.code == KeyCode::Char('c')) || keys::is(Action::Quit, &key) {
             self.ctrl_c();
             return;
         }
@@ -1284,11 +1448,10 @@ impl App {
             super::providers::on_key(self, key);
             return;
         }
-        if let Some(popup) = self.popup() {
-            if self.popup_key(popup, key) {
+        if let Some(popup) = self.popup()
+            && self.popup_key(popup, key) {
                 return;
             }
-        }
         self.chat_key(key);
     }
 
@@ -1311,7 +1474,7 @@ impl App {
             self.quit = true;
         } else {
             self.last_ctrl_c = Some(now);
-            self.notify(Role::Dim, "Press ctrl+c again to quit");
+            self.notify(Role::Dim, format!("Press {} again to quit", keys::label(Action::Quit)));
         }
     }
 
@@ -1409,34 +1572,42 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let cols = self.composer_cols();
         let before = self.composer.text().to_string();
+        if let Some(action) = keys::action_for(&key, self.composer.is_empty()) {
+            match action {
+                Action::Send => {
+                    if self.composer.text().ends_with('\\') {
+                        self.composer.backspace();
+                        self.composer.insert("\n");
+                    } else {
+                        self.submit();
+                    }
+                }
+                Action::NewLine => self.composer.insert("\n"),
+                Action::Stop => self.escape(),
+                Action::SwitchModel => self.open_models(),
+                Action::SwitchPrompt => self.open_prompts(),
+                Action::PastChats => self.open_history(),
+                Action::NewChat => self.new_chat(),
+                Action::ClearScreen => self.clear_screen(),
+                Action::ToggleReasoning => self.toggle_reasoning(),
+                Action::CopyReply => self.copy_last_reply(),
+                Action::ShowKeys => self.dialog = Some(Dialog::Keys),
+                Action::Quit => self.ctrl_c(),
+            }
+            self.after_edit(&before);
+            return;
+        }
         match key.code {
-            KeyCode::Char('p') if ctrl => self.open_models(),
-            KeyCode::Char('s') if ctrl => self.open_prompts(),
-            KeyCode::Char('r') if ctrl => self.open_history(),
-            KeyCode::Char('n') if ctrl => self.new_chat(),
-            KeyCode::Char('l') if ctrl => self.clear_screen(),
-            KeyCode::Char('o') if ctrl => self.toggle_reasoning(),
-            KeyCode::Char('y') if ctrl => self.copy_last_reply(),
             KeyCode::Char('u') if ctrl => self.composer.delete_to_start(),
             KeyCode::Char('k') if ctrl => self.composer.delete_to_end(),
             KeyCode::Char('w') if ctrl => self.composer.delete_word(),
             KeyCode::Char('a') if ctrl => self.composer.home(),
             KeyCode::Char('e') if ctrl => self.composer.end(),
-            KeyCode::Char('j') if ctrl => self.composer.insert("\n"),
-            KeyCode::Char('?') if self.composer.is_empty() => self.dialog = Some(Dialog::Keys),
             KeyCode::Char(c) if !ctrl => {
                 self.composer.insert(c.encode_utf8(&mut [0; 4]));
                 self.history_index = None;
             }
             KeyCode::Enter if shift || alt => self.composer.insert("\n"),
-            KeyCode::Enter => {
-                if self.composer.text().ends_with('\\') {
-                    self.composer.backspace();
-                    self.composer.insert("\n");
-                } else {
-                    self.submit();
-                }
-            }
             KeyCode::Backspace if alt || ctrl => self.composer.delete_word(),
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
@@ -1445,7 +1616,7 @@ impl App {
             KeyCode::Left => self.composer.left(),
             KeyCode::Right => self.composer.right(),
             KeyCode::Home if self.composer.is_empty() => self.scroll = usize::MAX,
-            KeyCode::End if self.composer.is_empty() => self.scroll = 0,
+            KeyCode::End if self.composer.is_empty() || ctrl => self.scroll = 0,
             KeyCode::Home => self.composer.home(),
             KeyCode::End => self.composer.end(),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(self.page_rows()),
@@ -1470,31 +1641,43 @@ impl App {
                     self.history_next();
                 }
             }
-            KeyCode::Esc => {
-                if self.turn.as_ref().is_some_and(|turn| turn.editing_args) {
-                    self.composer.clear();
-                    if let Some(turn) = self.turn.as_mut() {
-                        turn.editing_args = false;
-                    }
-                } else if self.turn.is_some() {
-                    self.stop();
-                } else if self.editing_last.is_some() {
-                    self.editing_last = None;
-                    self.composer.clear();
-                } else if !self.staged.is_empty() {
-                    self.staged.clear();
-                    self.notify(Role::Dim, "Removed the attached command output");
-                }
-            }
-            KeyCode::Tab => {}
+            KeyCode::Esc => self.escape(),
             _ => {}
         }
+        self.after_edit(&before);
+    }
+
+    fn after_edit(&mut self, before: &str) {
         if self.composer.text() != before {
             self.popup_selection = 0;
             self.popup_dismissed = None;
             if self.composer.text().is_empty() {
                 self.editing_last = None;
             }
+        }
+    }
+
+    /// esc (or the key bound to stop): stop the reply, or back out of
+    /// whatever is in progress.
+    fn escape(&mut self) {
+        if let Some(cancel) = self.sign_in_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+            self.notify(Role::Dim, "Sign-in cancelled");
+            return;
+        }
+        if self.turn.as_ref().is_some_and(|turn| turn.editing_args) {
+            self.composer.clear();
+            if let Some(turn) = self.turn.as_mut() {
+                turn.editing_args = false;
+            }
+        } else if self.turn.is_some() {
+            self.stop();
+        } else if self.editing_last.is_some() {
+            self.editing_last = None;
+            self.composer.clear();
+        } else if !self.staged.is_empty() {
+            self.staged.clear();
+            self.notify(Role::Dim, "Removed the attached command output");
         }
     }
 
@@ -1514,6 +1697,7 @@ impl App {
             narrow: self.width < 100,
             show_reasoning: self.show_reasoning,
             show_stats: self.config.show_stats,
+            pictures: self.config.images.preview != "off",
         }
     }
 
@@ -1548,6 +1732,9 @@ impl App {
         for entry in local {
             blocks.push(entry.lines.clone());
         }
+        if let Some((prompt, started)) = &self.drawing {
+            blocks.push(Rc::new(super::images::drawing_lines(prompt, "drawing", started.elapsed().as_millis() as u64, layout)));
+        }
         if let Some(turn) = &self.turn {
             blocks.extend(super::view::turn_blocks(turn, layout));
         }
@@ -1556,7 +1743,7 @@ impl App {
 }
 
 fn same_layout(a: &Layout, b: &Layout) -> bool {
-    a.width == b.width && a.narrow == b.narrow && a.show_reasoning == b.show_reasoning && a.show_stats == b.show_stats
+    a.width == b.width && a.narrow == b.narrow && a.show_reasoning == b.show_reasoning && a.show_stats == b.show_stats && a.pictures == b.pictures
 }
 
 struct ChannelSink {
@@ -1584,6 +1771,10 @@ impl engine::Sink for ChannelSink {
 
     fn warning(&mut self, text: &str) {
         let _ = self.tx.send(WorkerMsg::Turn(self.id, TurnEvent::Warning(text.to_string())));
+    }
+
+    fn signing_in(&mut self, server: &str, _url: &str) {
+        let _ = self.tx.send(WorkerMsg::Turn(self.id, TurnEvent::SigningIn(server.to_string())));
     }
 
     fn approve(&mut self, request: &Approval) -> Decision {

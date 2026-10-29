@@ -12,7 +12,7 @@ use crate::mcp::{self, DiscoveredTool};
 use crate::models::{Chat, Provider};
 use crate::search;
 use crate::secrets::Secrets;
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +66,8 @@ pub trait Sink {
     fn tool_started(&mut self, _label: &ToolLabel) {}
     fn tool_finished(&mut self, _log: &Value) {}
     fn warning(&mut self, _text: &str) {}
+    /// An MCP server needs a sign-in: the browser was opened at `url`.
+    fn signing_in(&mut self, _server: &str, _url: &str) {}
     fn approve(&mut self, request: &Approval) -> Decision;
 }
 
@@ -102,6 +104,22 @@ impl TurnOutput {
 }
 
 /// Split saved content into (reasoning, answer).
+/// The words of the last message the user sent (without attachments).
+pub fn last_user_text(messages: &[Value]) -> String {
+    let Some(last) = messages.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")) else {
+        return String::new();
+    };
+    match last.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 pub fn split_reasoning(content: &str) -> (String, String) {
     let mut reasoning = String::new();
     let mut answer = String::new();
@@ -255,7 +273,8 @@ pub fn run_turn(
     let mut definitions: Vec<Value> = Vec::new();
     if supports_tools {
         if !spec.chat.tool_ids.is_empty() {
-            let (tools, warnings) = mcp::discover(&db, &ctx.secrets, &spec.chat.tool_ids);
+            let (tools, warnings) =
+                mcp::discover(&db, &ctx.secrets, &spec.chat.tool_ids, cancel, &mut |server, url| sink.signing_in(server, url));
             for warning in warnings {
                 sink.warning(&warning);
             }
@@ -298,9 +317,17 @@ pub fn run_turn(
 
     let mut output = TurnOutput::default();
     for _round in 0..MAX_ROUNDS {
+        // Text after a tool call starts a new paragraph, before its first word.
+        let mut need_break = !output.content.is_empty() && !output.content.ends_with('\n');
         let mut on_event = |event: StreamEvent<'_>| match event {
             StreamEvent::Reasoning(delta) => sink.reasoning(delta),
-            StreamEvent::Text(delta) => sink.text(delta),
+            StreamEvent::Text(delta) => {
+                if need_break && !delta.is_empty() {
+                    sink.text("\n\n");
+                    need_break = false;
+                }
+                sink.text(delta)
+            }
         };
         let reply = api::chat(
             &spec.provider,
@@ -315,7 +342,6 @@ pub fn run_turn(
         if !reply.content.is_empty() {
             if !output.content.is_empty() && !output.content.ends_with('\n') {
                 output.content.push_str("\n\n");
-                sink.text("\n\n");
             }
             output.content.push_str(&reply.content);
         }
@@ -344,7 +370,7 @@ pub fn run_turn(
                 output.cancelled = true;
                 break;
             }
-            let log = run_tool(ctx, &db, &spec.chat, &mcp_tools, call, &mut output, sink);
+            let log = run_tool(ctx, &db, &spec.chat, &mcp_tools, call, &mut output, cancel, sink);
             spec.messages.push(json!({
                 "role": "tool",
                 "tool_call_id": log["tool_call_id"],
@@ -492,6 +518,7 @@ fn run_tool(
     mcp_tools: &[DiscoveredTool],
     call: &Value,
     output: &mut TurnOutput,
+    cancel: &AtomicBool,
     sink: &mut dyn Sink,
 ) -> Value {
     let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string();
@@ -580,7 +607,10 @@ fn run_tool(
                     }
                 }
                 if allowed {
-                    mcp::call(&found.server, &ctx.secrets, &found.tool.name, args.clone()).map_err(|e| format!("{e:#}"))
+                    mcp::call_signing_in(db, &ctx.secrets, &found.server, &found.tool.name, args.clone(), cancel, &mut |server, url| {
+                        sink.signing_in(server, url)
+                    })
+                    .map_err(|e| format!("{e:#}"))
                 } else {
                     log["status"] = json!("rejected");
                     Ok("The user declined this tool call.".into())

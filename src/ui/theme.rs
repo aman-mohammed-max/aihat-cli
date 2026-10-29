@@ -132,18 +132,44 @@ pub fn theme() -> &'static Theme {
     })
 }
 
-/// How many colours the given stream supports, honouring NO_COLOR and
-/// FORCE_COLOR. `None` when colour is off or the stream is not a terminal.
-pub fn detect_depth(stream: supports_color::Stream, no_color: bool) -> Depth {
+/// How many colours the given stream supports, honouring NO_COLOR, FORCE_COLOR
+/// and the `colors` setting (auto, truecolor, 256, 16 or none). `None` when
+/// colour is off or the stream is not a terminal.
+pub fn detect_depth(stream: supports_color::Stream, no_color: bool, setting: &str) -> Depth {
     if no_color || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         return Depth::None;
     }
-    match supports_color::on(stream) {
-        Some(level) if level.has_16m => Depth::TrueColor,
-        Some(level) if level.has_256 => Depth::Ansi256,
-        Some(_) => Depth::Ansi16,
-        None => Depth::None,
+    let forced = match setting.trim().to_lowercase().as_str() {
+        "truecolor" | "24bit" | "16m" => Some(Depth::TrueColor),
+        "256" => Some(Depth::Ansi256),
+        "16" => Some(Depth::Ansi16),
+        "none" | "off" => Some(Depth::None),
+        _ => None,
+    };
+    let level = supports_color::on(stream);
+    match (forced, level) {
+        (_, None) => Depth::None,
+        (Some(depth), Some(_)) => depth,
+        (None, Some(level)) if level.has_16m => Depth::TrueColor,
+        (None, Some(level)) if level.has_256 && likely_truecolor() => Depth::TrueColor,
+        (None, Some(level)) if level.has_256 => Depth::Ansi256,
+        (None, Some(_)) => Depth::Ansi16,
     }
+}
+
+/// Many terminals show 24-bit colour without setting COLORTERM (the ChromeOS
+/// terminal, xterm, Konsole, Windows Terminal). The ones that cannot are
+/// rarer: older macOS Terminal, the Linux console and GNU screen.
+fn likely_truecolor() -> bool {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    let term = var("TERM");
+    if var("TERM_PROGRAM") == "Apple_Terminal" {
+        return false;
+    }
+    if term.starts_with("screen") && var("TMUX").is_empty() {
+        return false;
+    }
+    term.contains("256color") || term.contains("direct") || !var("WT_SESSION").is_empty()
 }
 
 impl Theme {
@@ -265,7 +291,7 @@ fn parse_hex(value: &str) -> Option<(u8, u8, u8)> {
 }
 
 /// The closest colour in the xterm 256-colour cube or grey ramp.
-fn nearest_xterm((r, g, b): (u8, u8, u8)) -> u8 {
+pub fn nearest_xterm((r, g, b): (u8, u8, u8)) -> u8 {
     const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
     let nearest_level = |value: u8| {
         LEVELS

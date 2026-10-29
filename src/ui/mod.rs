@@ -3,7 +3,6 @@
 pub mod ansi;
 pub mod highlight;
 pub mod markdown;
+pub mod picture;
 pub mod text;
 pub mod theme;
-
-pub use theme::{Role, theme};

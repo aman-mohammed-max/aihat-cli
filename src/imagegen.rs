@@ -1,8 +1,10 @@
 use crate::api;
+use crate::api::SendRetry;
 use crate::db::Database;
 use crate::providers;
 use crate::secrets::Secrets;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use base64::Engine;
 use serde_json::Value;
 
 pub fn generate(
@@ -103,4 +105,37 @@ fn setting_url(settings: &Value) -> &str {
         .get("imageUrl")
         .and_then(Value::as_str)
         .unwrap_or("http://localhost:8188")
+}
+
+/// The bytes of one picture from an image response: inline base64 or a URL
+/// to fetch.
+pub fn picture_bytes(image: &Value) -> Result<Vec<u8>> {
+    if let Some(data) = image.get("b64_json").and_then(Value::as_str) {
+        let data = data.split_once("base64,").map(|(_, rest)| rest).unwrap_or(data);
+        return base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .context("could not decode the picture");
+    }
+    if let Some(url) = image.get("url").and_then(Value::as_str) {
+        if let Some((_, data)) = url.split_once("base64,") {
+            return base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .context("could not decode the picture");
+        }
+        let response = api::client(120_000)?.get(url).send_retry()?.error_for_status()?;
+        return Ok(response.bytes()?.to_vec());
+    }
+    bail!("the image service returned no picture data")
+}
+
+/// Who draws pictures: "gpt-image-1 · OpenAI", "Automatic1111" or "ComfyUI".
+pub fn engine_label(db: &Database) -> String {
+    let settings = db.settings();
+    match settings.get("imageEngine").and_then(Value::as_str).unwrap_or("provider") {
+        "a1111" => "Automatic1111".into(),
+        "comfyui" => "ComfyUI".into(),
+        _ => providers::resolve_image_provider_model(db, None, None)
+            .map(|(provider, model)| format!("{model} · {}", provider.name))
+            .unwrap_or_default(),
+    }
 }
