@@ -15,10 +15,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same branch replaces a build still running; tags always finish.
+# On other branches and pull requests a newer push replaces a build still
+# running. Builds of main and of tags always finish; a newer one waits.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
@@ -463,11 +464,20 @@ jobs:
             mkdir -p /usr/local/bin dist target
             install -m 0755 target/release/aihat /usr/local/bin/aihat
             printf '@name aihat-%s\n@cwd /usr/local\nbin/aihat\n' "$VERSION" > target/netbsd-packing-list
-            pkg_create -c "AI Hat CLI" \
+            # pkg_add checks these to see the package suits the system.
+            printf 'OPSYS=NetBSD\nOS_VERSION=%s\nMACHINE_ARCH=%s\nPKGTOOLS_VERSION=%s\n' \
+              "$(uname -r)" "$(uname -p)" "$(pkg_info -V)" > target/netbsd-build-info
+            # A leading "-" makes -c and -d take the text itself, not a file name.
+            if ! pkg_create -c "-AI Hat CLI" \
               -d "-AI Hat terminal chat and command line client" \
+              -B target/netbsd-build-info \
               -f target/netbsd-packing-list \
               -p /usr/local \
-              "target/aihat-${VERSION}.tgz"
+              "target/aihat-${VERSION}.tgz" > target/pkg_create.log 2>&1; then
+              cat target/pkg_create.log
+              echo "::error title=pkg_create::$(tr '\n' ' ' < target/pkg_create.log)"
+              exit 1
+            fi
             mv "target/aihat-${VERSION}.tgz" \
               "dist/aihat-netbsd-${{ matrix.asset_arch }}.tgz"
       - uses: actions/upload-artifact@v7
