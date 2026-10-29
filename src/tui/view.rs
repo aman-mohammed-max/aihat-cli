@@ -36,9 +36,6 @@ pub const COMMANDS: &[Command] = &[
     command("tools", "web search, image, MCP tools for this chat", None, false),
     command("mcp", "MCP servers and sign-in", None, false),
     command("skills", "turn skills on or off", None, false),
-    command("market", "find skills and MCP servers to add", None, false),
-    command("effort", "how much the model thinks: off, low, medium, high", None, false),
-    command("newprompt", "describe an assistant · the model writes its system prompt", None, true),
     command("new", "start a new chat", Some(Action::NewChat), false),
     command("resume", "open a past chat", Some(Action::PastChats), false),
     command("compact", "summarise to free context", None, false),
@@ -52,6 +49,10 @@ pub const COMMANDS: &[Command] = &[
     command("memory", "what models remember · on or off for this chat", None, false),
     command("keys", "show every key", Some(Action::ShowKeys), false),
     command("settings", "open settings.json", None, false),
+    // After the design's list: commands added since.
+    command("market", "find skills and MCP servers to add", None, false),
+    command("effort", "how much the model thinks: off, low, medium, high", None, false),
+    command("newprompt", "describe an assistant · the model writes its system prompt", None, true),
     command("about", "who made AI Hat · links", None, false),
     command("quit", "leave aihat", Some(Action::Quit), false),
 ];

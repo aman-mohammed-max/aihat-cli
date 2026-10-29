@@ -407,14 +407,13 @@ fn print_help() {
     let commands = [
         ("providers", "list, add, test, set-default, set-key, remove endpoints", ""),
         ("models", "list models · set the default model", ""),
-        ("prompts", "list, show, add system prompts · write one with AI", ""),
+        ("prompts", "list, show and add system prompts", ""),
         ("chats", "list, show, continue, export past chats", ""),
-        ("mcp", "list, add, search, sign in to MCP servers", ""),
-        ("skills", "list, add, search, enable, disable skills", ""),
+        ("mcp", "list, add, remove, sign in to MCP servers", ""),
+        ("skills", "list, enable, disable skills", ""),
         ("config", "get and set options ", &*format!("({config})")),
         ("backup", "export or restore everything ", "(same data as the phone app)"),
         ("image", "draw a picture with your image model", ""),
-        ("about", "who made AI Hat · links", ""),
     ];
     for (name, what, note) in commands {
         line(format!("  {}{what}{}", cmd(&pad(name, 12)), dim(note)));
