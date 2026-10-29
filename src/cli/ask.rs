@@ -166,7 +166,11 @@ pub fn run(env: &mut Env, options: Options) -> Result<i32> {
         model: model.clone(),
         messages,
         web: options.web,
-        folder: options.folder.then(|| std::env::current_dir().ok()).flatten(),
+        // The folder can be read when --folder says so or it was allowed
+        // before; otherwise the assistant's first look asks here.
+        folder: std::env::current_dir().ok().filter(|dir| dir.parent().is_some()),
+        folder_allowed: options.folder
+            || std::env::current_dir().is_ok_and(|dir| crate::folder::access(&env.db, &dir) == Some(crate::folder::Access::Allowed)),
     };
     let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let mut sink = CliSink::new(stdout_tty, stderr_tty && !options.json, options.json || !options.stream, env.yes, width);
@@ -672,7 +676,24 @@ impl engine::Sink for CliSink {
         self.spinner.stop();
         let t = theme();
         let interactive = std::io::stdin().is_terminal();
-        if let Some(folder) = &request.folder {
+        if request.kind == engine::ApprovalKind::ReadFolder {
+            let folder = request.folder.clone().unwrap_or_default();
+            eprintln!("{} The assistant wants to read the files in {}", paint("?", t.fg(Role::Warn)), paint(&folder, t.fg(Role::Link)));
+            if !interactive {
+                eprintln!("{}", paint("  Not allowed: no terminal to ask. Pass --folder to let it read this folder.", t.fg(Role::Dim)));
+                return Decision::Deny;
+            }
+            eprint!("  {} ", paint("Allow? (y)es · (a)lways for this folder · (N)o", t.fg(Role::Dim)));
+            let _ = std::io::stderr().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            return match answer.trim().to_lowercase().as_str() {
+                "y" | "yes" => Decision::Once,
+                "a" | "always" => Decision::AlwaysForServer,
+                _ => Decision::Deny,
+            };
+        }
+        if let Some(folder) = request.folder.as_ref().filter(|_| request.kind == engine::ApprovalKind::Command) {
             let command = request.arguments.get("command").and_then(Value::as_str).unwrap_or("");
             eprintln!("{} The assistant wants to run this in {}", paint("?", t.fg(Role::Warn)), paint(folder, t.fg(Role::Link)));
             eprintln!("  {} {}", paint("$", t.fg(Role::Dim)), paint(command, t.bold(Role::Strong)));
@@ -687,7 +708,7 @@ impl engine::Sink for CliSink {
                 paint(&request.tool, t.fg(Role::Link))
             );
         }
-        if let Some(map) = request.arguments.as_object().filter(|_| request.folder.is_none()) {
+        if let Some(map) = request.arguments.as_object().filter(|_| request.kind == engine::ApprovalKind::Tool) {
             let key_width = map.keys().map(|k| text::width(k)).max().unwrap_or(0).min(14);
             for (key, value) in map {
                 let value = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
@@ -698,7 +719,7 @@ impl engine::Sink for CliSink {
             eprintln!("{}", paint("  Denied: no terminal to ask. Pass --yes to allow tools that write.", t.fg(Role::Dim)));
             return Decision::Deny;
         }
-        let question = if request.folder.is_some() { "Run it? (y)es once · (a)lways run this here · (N)o" } else { "Allow? (y)es once · (a)lways for this server · (N)o" };
+        let question = if request.kind == engine::ApprovalKind::Command { "Run it? (y)es once · (a)lways run this here · (N)o" } else { "Allow? (y)es once · (a)lways for this server · (N)o" };
         eprint!("  {} ", paint(question, t.fg(Role::Dim)));
         let _ = std::io::stderr().flush();
         let mut answer = String::new();

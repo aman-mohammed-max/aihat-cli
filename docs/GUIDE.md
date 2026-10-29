@@ -120,11 +120,11 @@ Global skills, the ones other coding agents use, work here too: `~/.agents/skill
 
 ## Your folder
 
-The first time aihat opens in a folder it asks whether the assistant may read it: **Yes, allow this folder**, **Only for now**, or **No, keep it private** (only the arrow keys and enter answer, so typing straight away can't). `/folder` shows the answer and changes it.
+Nothing is asked when aihat opens. The first time the assistant wants to look at the files in the folder you started it in, a box asks in the chat: **Let the assistant read this folder?** with **Allow until I quit**, **Always allow this folder** or **Don't allow**. You can also answer ahead of time by typing `/folder allow` (always), `/folder session` (until you quit) or `/folder off`; `/folder` alone shows the answer.
 
-Allowed, the assistant can list, read and search the files in the folder and the folders inside it (what `.gitignore` leaves out is skipped, and nothing outside the folder can be read). It can also ask to run a command there; every command waits in a **Run this command?** box with the command and why: **Run it once**, **Always run this here** (that exact command, in this folder), **Edit the command**, or **Don't run it**. Commands stop after two minutes or when you press esc. Skills that come with scripts go through the same box. `/folder` lists the commands you always allow, and `c` clears them.
+Allowed, the assistant can list, read and search the files in the folder and the folders inside it (what `.gitignore` leaves out is skipped, and nothing outside the folder can be read). Running a command is asked every time, in a **Run this command?** box with the command and why: **Run it once**, **Always run this here** (that exact command, in this folder), **Edit the command**, or **Don't run it**. Commands stop after two minutes or when you press esc. Skills that come with scripts go through the same box. `/folder` lists the commands you always allow, and `/folder clear` (or `c` there) clears them.
 
-For one prompt from the shell: `aihat --folder "why do the tests fail?"` (commands ask on the terminal; `--yes` allows them).
+From the shell, `aihat --folder "why do the tests fail?"` lets it read the folder for that prompt; without `--folder` it asks on the terminal the first time it looks. Commands always ask (`--yes` allows them).
 
 ## Pasting
 

@@ -2276,7 +2276,20 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
     let border = t.fg(Role::Warn);
     let inner = total_width.saturating_sub(4).max(20);
     let mut body: Vec<Line<'static>> = Vec::new();
-    if let Some(folder) = &request.folder {
+    if request.kind == crate::engine::ApprovalKind::ReadFolder {
+        // The assistant's first look at the folder.
+        let folder = request.folder.clone().unwrap_or_default();
+        body.push(Line::from(vec![Span::styled("The assistant wants to read the files in ", t.fg(Role::Text)), Span::styled(folder, t.fg(Role::Link))]));
+        let what = match (request.tool.as_str(), request.arguments.get("path").and_then(Value::as_str), request.arguments.get("query").and_then(Value::as_str)) {
+            ("read_file", Some(path), _) => format!("starting with {path}"),
+            ("search_files", _, Some(query)) => format!("to search for “{query}”"),
+            _ => "starting with a list of what is there".to_string(),
+        };
+        body.push(Line::styled(what, t.fg(Role::Dim)));
+        body.push(Line::default());
+        body.push(Line::styled("It can read and search files in this folder and the folders inside it, never outside it.", t.fg(Role::Dim)));
+        body.push(Line::default());
+    } else if let Some(folder) = request.folder.as_ref().filter(|_| request.kind == crate::engine::ApprovalKind::Command) {
         // A command the assistant wants to run: the command line itself, and why.
         body.push(Line::from(vec![Span::styled("The assistant wants to run this in ", t.fg(Role::Text)), Span::styled(folder.clone(), t.fg(Role::Link))]));
         body.push(Line::default());
@@ -2301,7 +2314,7 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
         ]));
         body.push(Line::default());
     }
-    if let Some(map) = request.arguments.as_object().filter(|_| request.folder.is_none()) {
+    if let Some(map) = request.arguments.as_object().filter(|_| request.kind == crate::engine::ApprovalKind::Tool) {
         let key_width = map.keys().map(|k| width(k)).max().unwrap_or(0).min(14);
         for (key, value) in map.iter().take(8) {
             let value = value
@@ -2319,36 +2332,43 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
         }
         body.push(Line::default());
     }
-    let command = request.folder.is_some();
+    let command = request.kind == crate::engine::ApprovalKind::Command;
+    let reading = request.kind == crate::engine::ApprovalKind::ReadFolder;
     let always = if command { "Always run this here".to_string() } else { format!("Always for {}", request.server) };
-    let options = [
-        (if command { "Run it once" } else { "Allow once" }, "enter"),
-        (always.as_str(), "a"),
-        (if command { "Edit the command" } else { "Edit the arguments" }, "e"),
-        (if command { "Don't run it" } else { "Deny" }, "esc"),
-    ];
+    let options: Vec<(&str, &str)> = if reading {
+        vec![("Allow until I quit", "enter"), ("Always allow this folder", "a"), ("Don't allow", "esc")]
+    } else {
+        vec![
+            (if command { "Run it once" } else { "Allow once" }, "enter"),
+            (always.as_str(), "a"),
+            (if command { "Edit the command" } else { "Edit the arguments" }, "e"),
+            (if command { "Don't run it" } else { "Deny" }, "esc"),
+        ]
+    };
     let mut option_rows = Vec::new();
+    // The design's 18 columns, or more for a longer label.
+    let label_width = options.iter().map(|(label, _)| width(label)).max().unwrap_or(0).max(18);
     for (index, (label, key)) in options.iter().enumerate() {
         let selected = index == pending.selection;
         // Laid out as the design draws it: the highlight ends three columns
         // before the chosen key; the other keys sit one column further right.
         let line = if selected {
             Line::from(vec![
-                Span::styled(format!(" › {}", text::pad(label, 18)), t.selected(Role::Accent)),
+                Span::styled(format!(" › {}", text::pad(label, label_width)), t.selected(Role::Accent)),
                 Span::raw("   "),
                 Span::styled(key.to_string(), t.fg(Role::Text)),
             ])
         } else {
             Line::from(vec![
-                Span::styled(format!("   {}", text::pad(label, 22)), t.fg(Role::Text)),
+                Span::styled(format!("   {}", text::pad(label, label_width + 4)), t.fg(Role::Text)),
                 Span::styled(key.to_string(), t.fg(Role::Dim)),
             ])
         };
         option_rows.push((line, selected));
     }
-    let kind = if command { "runs on this computer" } else if request.writes { "MCP · writes data" } else { "MCP · reads data" };
+    let kind = if reading { "reads files" } else if command { "runs on this computer" } else if request.writes { "MCP · writes data" } else { "MCP · reads data" };
     let g = t.glyphs();
-    let title = format!("{} {} ", g.horizontal, if command { "Run this command?" } else { "Allow this tool?" });
+    let title = format!("{} {} ", g.horizontal, if reading { "Let the assistant read this folder?" } else if command { "Run this command?" } else { "Allow this tool?" });
     let right = format!(" {kind} {}", g.horizontal);
     let fill = (total_width.saturating_sub(2)).saturating_sub(width(&title) + width(&right));
     let mut out = vec![Line::styled(

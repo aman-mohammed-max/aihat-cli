@@ -40,20 +40,35 @@ pub struct TurnSpec {
     pub messages: Vec<Value>,
     /// Offer the web_search tool.
     pub web: bool,
-    /// The folder the person allowed the assistant to read (and to ask to
-    /// run commands in).
+    /// The folder aihat runs in, unless the person said no to it. The
+    /// assistant can ask to read it and to run commands there.
     pub folder: Option<PathBuf>,
+    /// Reading the folder is already allowed; otherwise the first read asks.
+    pub folder_allowed: bool,
 }
 
-/// A write tool, or a command, waiting for the user's answer.
+/// What is waiting for the user's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// An MCP tool that writes data.
+    Tool,
+    /// A command the assistant wants to run in the folder.
+    Command,
+    /// The assistant's first look at the folder's files.
+    ReadFolder,
+}
+
+/// A write tool, a command, or reading the folder, waiting for the user's
+/// answer.
 #[derive(Clone, Debug)]
 pub struct Approval {
     pub server: String,
     pub tool: String,
     pub writes: bool,
     pub arguments: Value,
-    /// Set for a command the assistant wants to run: the folder it runs in.
+    /// The folder a command runs in, or that would be read.
     pub folder: Option<String>,
+    pub kind: ApprovalKind,
 }
 
 #[derive(Clone, Debug)]
@@ -372,7 +387,7 @@ pub fn run_turn(
         }
         if let Some(dir) = &spec.folder {
             definitions.extend(crate::folder::tool_definitions());
-            append_system(&mut spec.messages, &crate::folder::instruction(dir));
+            append_system(&mut spec.messages, &crate::folder::instruction(dir, spec.folder_allowed));
         }
     }
     if spec.web {
@@ -385,6 +400,7 @@ pub fn run_turn(
     }
 
     let mut output = TurnOutput::default();
+    let mut folder_allowed = spec.folder_allowed;
     for _round in 0..MAX_ROUNDS {
         // Text after a tool call starts a new paragraph, before its first word.
         let mut need_break = !output.content.is_empty() && !output.content.ends_with('\n');
@@ -439,7 +455,8 @@ pub fn run_turn(
                 output.cancelled = true;
                 break;
             }
-            let log = run_tool(ctx, &db, &spec.chat, spec.folder.as_deref(), &mcp_tools, call, &mut output, cancel, sink);
+            let folder = spec.folder.as_deref().map(|dir| (dir, &mut folder_allowed));
+            let log = run_tool(ctx, &db, &spec.chat, folder, &mcp_tools, call, &mut output, cancel, sink);
             spec.messages.push(json!({
                 "role": "tool",
                 "tool_call_id": log["tool_call_id"],
@@ -584,7 +601,7 @@ fn run_tool(
     ctx: &Context,
     db: &Database,
     chat: &Chat,
-    folder: Option<&std::path::Path>,
+    folder: Option<(&std::path::Path, &mut bool)>,
     mcp_tools: &[DiscoveredTool],
     call: &Value,
     output: &mut TurnOutput,
@@ -626,11 +643,39 @@ fn run_tool(
         }
         "read_skill_file" => read_skill_file(db, &args),
         "list_files" | "read_file" | "search_files" => match folder {
-            Some(root) => crate::folder::read_tool(root, &name, &args),
+            Some((root, allowed)) => {
+                // The first look at the folder asks the user.
+                if !*allowed {
+                    let request = Approval {
+                        server: "AI Hat".into(),
+                        tool: name.clone(),
+                        writes: false,
+                        arguments: args.clone(),
+                        folder: Some(crate::ui::text::home_relative(root)),
+                        kind: ApprovalKind::ReadFolder,
+                    };
+                    match sink.approve(&request) {
+                        Decision::Once | Decision::Edited(_) => *allowed = true,
+                        Decision::AlwaysForServer => {
+                            *allowed = true;
+                            if let Err(error) = crate::folder::set_access(db, root, Some(crate::folder::Access::Allowed)) {
+                                sink.warning(&format!("Could not save the permission: {error}"));
+                            }
+                        }
+                        Decision::Deny => {}
+                    }
+                }
+                if *allowed {
+                    crate::folder::read_tool(root, &name, &args)
+                } else {
+                    log["status"] = json!("rejected");
+                    Ok("The user didn't allow reading this folder. Don't try again unless they ask; they can allow it with /folder allow.".into())
+                }
+            }
             None => Err("The user hasn't allowed reading this folder.".into()),
         },
         "run_command" => match folder {
-            Some(root) => {
+            Some((root, _)) => {
                 let mut command = args.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
                 let mut allowed = crate::folder::allowed_commands(db, root).contains(&command);
                 if !allowed && !command.is_empty() {
@@ -640,6 +685,7 @@ fn run_tool(
                         writes: true,
                         arguments: args.clone(),
                         folder: Some(crate::ui::text::home_relative(root)),
+                        kind: ApprovalKind::Command,
                     };
                     match sink.approve(&request) {
                         Decision::Once => allowed = true,
@@ -708,6 +754,7 @@ fn run_tool(
                         writes: found.tool.kind != "read",
                         arguments: args.clone(),
                         folder: None,
+                        kind: ApprovalKind::Tool,
                     };
                     match sink.approve(&request) {
                         Decision::Once => {}

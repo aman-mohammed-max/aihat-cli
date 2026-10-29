@@ -92,10 +92,11 @@ pub fn forget_commands(db: &Database, dir: &Path) -> anyhow::Result<()> {
     save(db, &folders)
 }
 
-/// What the model is told when it may use the folder.
-pub fn instruction(dir: &Path) -> String {
+/// What the model is told about the folder.
+pub fn instruction(dir: &Path, allowed: bool) -> String {
+    let asking = if allowed { "" } else { " The first time you look, the user is asked to allow it." };
     format!(
-        "You are working in the folder {} on the user's computer. Use list_files, read_file and search_files to look at its files when that helps; paths are relative to the folder. Use run_command to run a shell command there: the user approves every command before it runs, so give a short reason. Don't run commands that delete or change files unless the user asked for that.",
+        "The user is running AI Hat in the folder {} on their computer. When their request is about files there, use list_files, read_file and search_files (paths are relative to the folder).{asking} Use run_command to run a shell command there: the user approves every command before it runs, so give a short reason. Don't run commands that delete or change files unless the user asked for that. Don't look at the folder for questions that have nothing to do with it.",
         crate::ui::text::home_relative(dir)
     )
 }

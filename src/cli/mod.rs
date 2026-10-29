@@ -424,13 +424,14 @@ fn print_help() {
     }
     line(String::new());
     line(strong("Options for one prompt"));
-    let options: [(&str, &str, &str, String); 10] = [
+    let options: [(&str, &str, &str, String); 11] = [
         ("-m, --model", "<id>", "model to use ", format!("(default: {model})")),
         ("-P, --provider", "<name>", "provider to use ", format!("(default: {provider})")),
         ("-s, --system", "<name>", "saved system prompt to use", String::new()),
         ("-f, --file", "<path>", "attach a file, repeatable ", "· piped stdin is attached too".into()),
         ("-w, --web", "", "web search on", String::new()),
         ("-e, --effort", "<level>", "how much the model thinks ", "· off, low, medium, high".into()),
+        ("    --folder", "", "let the assistant read this folder ", "· commands still ask".into()),
         ("-c, --continue", "", "continue the last chat", String::new()),
         ("-t, --tool", "<server>", "turn on an MCP server, repeatable", String::new()),
         ("    --json", "", "print JSON: reply, usage, sources", String::new()),

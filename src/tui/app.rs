@@ -135,6 +135,14 @@ pub struct ActiveTurn {
     pub signing_in: Option<(String, Instant)>,
 }
 
+/// The folder aihat runs in: allowed (always, or until aihat quits), said no
+/// to for now, or not asked yet (the assistant's first look asks).
+pub struct FolderAccess {
+    pub dir: std::path::PathBuf,
+    pub allowed: bool,
+    pub denied: bool,
+}
+
 pub struct Notice {
     pub text: String,
     pub role: Role,
@@ -164,8 +172,8 @@ pub struct App {
     pub composer: Composer,
     pub page: Page,
     pub dialog: Option<Dialog>,
-    /// The folder the assistant may read, when the person allowed it.
-    pub folder: Option<std::path::PathBuf>,
+    /// The folder aihat runs in, and what the person said about it.
+    pub folder: Option<FolderAccess>,
     pub popup_selection: usize,
     pub popup_dismissed: Option<String>,
     pub turn: Option<ActiveTurn>,
@@ -271,14 +279,13 @@ impl App {
         if let Some(id) = initial_chat {
             app.open_chat(&id)?;
         }
-        // The folder aihat runs in: allowed before, kept private, or asked now.
-        if let Ok(dir) = std::env::current_dir() {
-            match crate::folder::access(&app.db, &dir) {
-                Some(crate::folder::Access::Allowed) => app.folder = Some(dir),
-                Some(crate::folder::Access::Denied) => {}
-                None if dir.parent().is_some() => app.dialog = Some(Dialog::Folder(super::folder::FolderDialog::new(dir, true))),
-                None => {}
-            }
+        // The folder aihat runs in. Nothing is asked now: the assistant's
+        // first look at it asks, unless it was allowed before.
+        if let Ok(dir) = std::env::current_dir()
+            && dir.parent().is_some()
+        {
+            let allowed = crate::folder::access(&app.db, &dir) == Some(crate::folder::Access::Allowed);
+            app.folder = Some(FolderAccess { dir, allowed, denied: false });
         }
         Ok(app)
     }
@@ -497,7 +504,8 @@ impl App {
             model,
             messages,
             web,
-            folder: self.folder.clone(),
+            folder: self.folder.as_ref().filter(|f| !f.denied).map(|f| f.dir.clone()),
+            folder_allowed: self.folder.as_ref().is_some_and(|f| f.allowed),
         };
         self.start_turn(spec);
     }
@@ -687,6 +695,16 @@ impl App {
             return;
         };
         if let Some(pending) = turn.approval.take() {
+            // The answer about reading the folder holds until aihat quits
+            // ("always" is also saved by the turn).
+            if pending.request.kind == engine::ApprovalKind::ReadFolder
+                && let Some(folder) = self.folder.as_mut()
+            {
+                match decision {
+                    Decision::Deny => folder.denied = true,
+                    _ => folder.allowed = true,
+                }
+            }
             let _ = pending.reply.send(decision);
         }
         turn.editing_args = false;
@@ -701,8 +719,11 @@ impl App {
             return;
         };
         // A command is edited as the command line itself.
-        let text = match (&pending.request.folder, pending.request.arguments.get("command").and_then(Value::as_str)) {
-            (Some(_), Some(command)) => command.to_string(),
+        if pending.request.kind == engine::ApprovalKind::ReadFolder {
+            return;
+        }
+        let text = match (pending.request.kind, pending.request.arguments.get("command").and_then(Value::as_str)) {
+            (engine::ApprovalKind::Command, Some(command)) => command.to_string(),
             _ => serde_json::to_string_pretty(&pending.request.arguments).unwrap_or_default(),
         };
         turn.editing_args = true;
@@ -710,7 +731,7 @@ impl App {
     }
 
     fn submit_edited_arguments(&mut self) {
-        let command = self.turn.as_ref().and_then(|turn| turn.approval.as_ref()).filter(|pending| pending.request.folder.is_some()).map(|pending| pending.request.arguments.clone());
+        let command = self.turn.as_ref().and_then(|turn| turn.approval.as_ref()).filter(|pending| pending.request.kind == engine::ApprovalKind::Command).map(|pending| pending.request.arguments.clone());
         if let Some(mut arguments) = command {
             let line = self.composer.text().trim().to_string();
             if line.is_empty() {
@@ -878,10 +899,7 @@ impl App {
             "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
             "about" | "version" => self.dialog = Some(Dialog::About(Default::default())),
-            "folder" | "workspace" | "access" => match std::env::current_dir() {
-                Ok(dir) => self.dialog = Some(Dialog::Folder(super::folder::FolderDialog::new(dir, false))),
-                Err(error) => self.fail(error.to_string()),
-            },
+            "folder" | "workspace" | "access" => super::folder::command(self, args),
             "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
             "" => {}
@@ -1691,10 +1709,17 @@ impl App {
         let Some(pending) = self.turn.as_mut().and_then(|turn| turn.approval.as_mut()) else {
             return;
         };
+        // Reading the folder has three answers; tools and commands have four.
+        let reading = pending.request.kind == engine::ApprovalKind::ReadFolder;
         match key.code {
             KeyCode::Up => pending.selection = pending.selection.saturating_sub(1),
-            KeyCode::Down => pending.selection = (pending.selection + 1).min(3),
+            KeyCode::Down => pending.selection = (pending.selection + 1).min(if reading { 2 } else { 3 }),
             KeyCode::Char('a') => self.answer_approval(Decision::AlwaysForServer),
+            KeyCode::Enter if reading => match pending.selection {
+                0 => self.answer_approval(Decision::Once),
+                1 => self.answer_approval(Decision::AlwaysForServer),
+                _ => self.answer_approval(Decision::Deny),
+            },
             KeyCode::Char('e') => self.edit_approval_arguments(),
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('d') => self.answer_approval(Decision::Deny),
             KeyCode::Char('y') => self.answer_approval(Decision::Once),

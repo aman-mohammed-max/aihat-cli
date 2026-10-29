@@ -167,7 +167,7 @@ Already use the AI Hat app on this computer? Your providers, prompts and chats a
 - **✍️ Writes system prompts for you.** `/prompt a patient Rust tutor` and the model writes one, saves it and uses it in the chat.
 - **🧠 Remembers you.** Your name, projects and preferences carry across chats. See and edit them with `/memory`.
 - **⌨️ Works your way.** Every shortcut, colour and option is in one file: `aihat config edit`.
-- **📁 Works in your folder.** With your OK, the assistant reads and searches the files in the folder you start it in, and asks before it runs any command there. `/folder` changes your answer.
+- **📁 Works in your folder.** When the assistant wants to look at the files in the folder you started it in, it asks you first (or allow it ahead of time: `/folder allow`, or `aihat --folder` from the shell). It also asks before running any command there.
 - **🔒 Private by default.** Chats stay on your computer. API keys go to your system keychain (or a private file only you can read on Linux and BSD). Nothing leaves your computer except what goes to the models, search and tools you set up.
 
 ## Keys
