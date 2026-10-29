@@ -290,11 +290,14 @@ jobs:
         with:
           release: "15.1"
           arch: ${{ matrix.vm_arch }}
-          prepare: pkg install -y rust
           run: |
             set -eu
-            rustc --version
-            cargo build --locked --release
+            STEP=start
+            trap 'code=$?; [ "$code" = 0 ] || echo "::error title=FreeBSD::failed at: $STEP (exit $code)"' EXIT
+            STEP="install rust"; pkg install -y rust
+            STEP="rustc"; rustc --version
+            STEP="cargo build"; sh .github/scripts/cargo-build.sh
+            STEP="package"
             VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
             if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
             mkdir -p dist target/freebsd-root/usr/local/bin
@@ -362,11 +365,14 @@ jobs:
         with:
           release: "8.0"
           arch: ${{ matrix.vm_arch }}
-          prepare: pkg_add rust
           run: |
             set -eu
-            rustc --version
-            cargo build --locked --release
+            STEP=start
+            trap 'code=$?; [ "$code" = 0 ] || echo "::error title=OpenBSD::failed at: $STEP (exit $code)"' EXIT
+            STEP="install rust"; pkg_add rust
+            STEP="rustc"; rustc --version
+            STEP="cargo build"; sh .github/scripts/cargo-build.sh
+            STEP="package"
             VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
             if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
             mkdir -p dist target/openbsd-root/usr/local/bin
@@ -405,12 +411,15 @@ jobs:
         with:
           release: "11.0"
           arch: ${{ matrix.vm_arch }}
-          prepare: /usr/sbin/pkg_add -u rust
           run: |
             set -eu
+            STEP=start
+            trap 'code=$?; [ "$code" = 0 ] || echo "::error title=NetBSD::failed at: $STEP (exit $code)"' EXIT
             export PATH="/usr/pkg/bin:/usr/pkg/sbin:$PATH"
-            rustc --version
-            cargo build --locked --release
+            STEP="install rust"; command -v rustc >/dev/null || /usr/sbin/pkg_add rust
+            STEP="rustc"; rustc --version
+            STEP="cargo build"; sh .github/scripts/cargo-build.sh
+            STEP="package"
             VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
             if [ "${GITHUB_REF_TYPE:-}" = tag ]; then VERSION=${GITHUB_REF_NAME#v}; fi
             mkdir -p /usr/local/bin dist target
