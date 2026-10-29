@@ -2,7 +2,6 @@
 
 use super::app::{App, Page, PendingApproval, Task};
 use super::draw::{self, put, put_line};
-use crate::engine::Decision;
 use crate::models::Model;
 use crate::ui::text::{self, width};
 use crate::ui::theme::{Role, theme};
@@ -11,7 +10,6 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::{Value, json};
 
@@ -26,6 +24,8 @@ pub enum Dialog {
     Form(Form),
     Confirm(Confirm),
     Text(TextView),
+    Image(Box<super::images::ImageViewer>),
+    Memory(MemoryDialog),
 }
 
 // ------------------------------------------------------------------ shared
@@ -493,7 +493,13 @@ impl HistoryPicker {
             .into_iter()
             .enumerate()
             .map(|(index, row)| match row {
-                PickRow::Item(line, key, ok) => PickRow::Item(emphasise(line, Some(index) == self.selected), key, ok),
+                // The design draws the chosen chat two columns further left.
+                PickRow::Item(line, key, ok) if Some(index) == self.selected => PickRow::Item(emphasise(line, true), key, ok),
+                PickRow::Item(line, key, ok) => {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(line.spans);
+                    PickRow::Item(Line::from(spans), key, ok)
+                }
                 header => header,
             })
             .collect();
@@ -575,6 +581,7 @@ impl HistoryPicker {
 // ------------------------------------------------------------------ keys
 
 fn draw_keys(buf: &mut Buffer, screen: Rect) {
+    use super::keys::{Action, label};
     let t = theme();
     let area = draw::dialog_rect(screen, 84, 17, 5);
     draw::boxed(buf, area, t.fg(Role::Accent), "Keys", "esc close");
@@ -585,56 +592,177 @@ fn draw_keys(buf: &mut Buffer, screen: Rect) {
         put(buf, half, y, right, t.bold(Role::Strong), inner.right());
     };
     let pair = |buf: &mut Buffer, x: u16, y: u16, key: &str, key_width: usize, what: &str, right: u16| {
+        let key_width = key_width.max(width(key) + 1);
         put(buf, x, y, &text::pad(key, key_width), t.fg(Role::Link), right);
         put(buf, x + key_width as u16, y, what, t.fg(Role::Text), right);
     };
     let mut y = inner.y;
     head(buf, y, "Chat", "Anywhere");
     let chat = [
-        ("enter", "send"),
-        ("shift+enter", "new line"),
-        ("esc", "stop the reply"),
+        (label(Action::Send), "send"),
+        (label(Action::NewLine), "new line"),
+        (label(Action::Stop), "stop the reply"),
         ("↑", "edit your last message"),
-        ("ctrl+o", "show or hide reasoning"),
-        ("ctrl+y", "copy the last reply"),
+        (label(Action::ToggleReasoning), "show or hide reasoning"),
+        (label(Action::CopyReply), "copy the last reply"),
     ];
     let anywhere = [
-        ("ctrl+p", "switch model"),
-        ("ctrl+s", "switch system prompt"),
-        ("ctrl+r", "past chats"),
-        ("ctrl+n", "new chat"),
-        ("ctrl+l", "clear the screen"),
-        ("ctrl+c", "twice to quit"),
+        (label(Action::SwitchModel), "switch model"),
+        (label(Action::SwitchPrompt), "switch system prompt"),
+        (label(Action::PastChats), "past chats"),
+        (label(Action::NewChat), "new chat"),
+        (label(Action::ClearScreen), "clear the screen"),
+        (label(Action::Quit), "twice to quit"),
     ];
     for ((left_key, left_what), (right_key, right_what)) in chat.iter().zip(anywhere.iter()) {
         y += 1;
         pair(buf, inner.x, y, left_key, 13, left_what, half - 1);
-        pair(buf, half, y, right_key, 9, right_what, inner.right());
+        pair(buf, half + 1, y, right_key, 9, right_what, inner.right());
     }
     y += 2;
     head(buf, y, "Typing", "Lists and dialogs");
     y += 1;
     pair(buf, inner.x, y, "/", 13, "commands", half - 1);
-    pair(buf, half, y, "↑ ↓", 9, "move", inner.right());
+    pair(buf, half + 1, y, "↑ ↓", 9, "move", inner.right());
     y += 1;
     pair(buf, inner.x, y, "@", 13, "attach a file or URL", half - 1);
-    pair(buf, half, y, "tab", 9, "complete or switch pane", inner.right());
+    pair(buf, half + 1, y, "tab", 9, "complete or switch pane", inner.right());
     y += 1;
     pair(buf, inner.x, y, "!", 13, "run a shell command, add its output to the message", inner.right());
     y += 1;
     pair(buf, inner.x, y, "#", 13, "save a note to the system prompt", inner.right());
     y += 2;
-    let config = crate::ui::text::home_relative(
-        &dirs::config_dir().unwrap_or_default().join("aihat").join("config.toml"),
+    let settings = crate::ui::text::home_relative(
+        &dirs::config_dir().unwrap_or_default().join("aihat").join("settings.json"),
     );
     put(
         buf,
         inner.x,
         y,
-        &format!("Settings in {config} · works in 80×24 and wider"),
+        &format!(
+            "Change keys in {} · works in 80×24 and wider",
+            text::truncate_left(&settings, (inner.width as usize).saturating_sub(43))
+        ),
         t.fg(Role::Dim),
         inner.right(),
     );
+}
+
+// ------------------------------------------------------------------ memory
+
+/// /memory: what models remember across chats, and whether this chat uses it.
+#[derive(Default)]
+pub struct MemoryDialog {
+    selected: usize,
+    adding: Option<super::composer::Composer>,
+}
+
+impl MemoryDialog {
+    fn draw(&self, app: &App, buf: &mut Buffer, screen: Rect) {
+        let t = theme();
+        let items = crate::memory::list(&app.db);
+        let everywhere = app.db.settings().get("memoryEnabled").and_then(Value::as_bool).unwrap_or(true);
+        let here = app.chat.as_ref().is_none_or(|chat| chat.memory_enabled && !chat.temporary);
+        let state = match (everywhere, here) {
+            (false, _) => "off everywhere",
+            (true, false) => "off for this chat",
+            (true, true) => "on for this chat",
+        };
+        let visible = items.len().clamp(1, 12);
+        let extra = if self.adding.is_some() { 3 } else { 0 };
+        let area = draw::dialog_rect(screen, 84, visible as u16 + 5 + extra, 5);
+        draw::boxed(buf, area, t.fg(Role::Accent), "Memory", &format!("{state} · {} saved", items.len()));
+        let inner = draw::inner(area);
+        if items.is_empty() {
+            put(buf, inner.x, inner.y, "Nothing saved yet. Models keep what will matter in later chats; a adds one.", t.fg(Role::Dim), inner.right());
+        }
+        let first = window(self.selected, items.len(), visible);
+        for (offset, (_, title, body)) in items.iter().enumerate().skip(first).take(visible) {
+            let selected = offset == self.selected && self.adding.is_none();
+            let title_style = if selected { t.fg(Role::Accent) } else { t.fg(Role::Strong) };
+            let line = Line::from(vec![
+                Span::styled(text::pad(&text::truncate(title, 22), 24), title_style),
+                Span::styled(text::truncate(body, (inner.width as usize).saturating_sub(25)), if selected { title_style } else { t.fg(Role::Text) }),
+            ]);
+            draw::row(buf, inner, inner.y + (offset - first) as u16, line, selected);
+        }
+        let mut y = inner.y + visible as u16 + 1;
+        if let Some(editor) = &self.adding {
+            put(buf, inner.x, y, "Remember", t.fg(Role::Strong), inner.right());
+            y += 1;
+            put(buf, inner.x, y, "›", t.fg(Role::Accent), inner.right());
+            let shown = text::truncate_left(editor.text(), (inner.width as usize).saturating_sub(4));
+            let end = put(buf, inner.x + 2, y, &shown, t.fg(Role::Strong), inner.right());
+            cursor_at(buf, end, y);
+            y += 1;
+            put(buf, inner.x, y, "enter saves · esc back · one short sentence", t.fg(Role::Dim), inner.right());
+            return;
+        }
+        put(
+            buf,
+            inner.x,
+            inner.bottom() - 1,
+            "m on/off for this chat · g on/off everywhere · a add · d forget · esc close",
+            t.fg(Role::Dim),
+            inner.right(),
+        );
+    }
+
+    fn key(&mut self, app: &mut App, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(editor) = self.adding.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.adding = None,
+                KeyCode::Enter => {
+                    match crate::memory::add(&app.db, "", editor.text()) {
+                        Ok(title) => app.ok(format!("Saved to memory: {title}")),
+                        Err(error) => app.fail(error.to_string()),
+                    }
+                    self.adding = None;
+                    self.selected = 0;
+                }
+                KeyCode::Char('u') if ctrl => editor.delete_to_start(),
+                KeyCode::Char('w') if ctrl => editor.delete_word(),
+                KeyCode::Char(c) if !ctrl => editor.insert(c.encode_utf8(&mut [0; 4])),
+                KeyCode::Backspace => editor.backspace(),
+                KeyCode::Left => editor.left(),
+                KeyCode::Right => editor.right(),
+                KeyCode::Home => editor.home(),
+                KeyCode::End => editor.end(),
+                _ => {}
+            }
+            return true;
+        }
+        let count = crate::memory::list(&app.db).len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return false,
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => self.selected = (self.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('a') => self.adding = Some(super::composer::Composer::default()),
+            KeyCode::Char('m') => app.toggle_memory(),
+            KeyCode::Char('g') => {
+                let mut settings = app.db.settings();
+                if !settings.is_object() {
+                    settings = json!({});
+                }
+                let on = !settings.get("memoryEnabled").and_then(Value::as_bool).unwrap_or(true);
+                settings["memoryEnabled"] = json!(on);
+                match app.db.set_kv("settings", &settings.to_string()) {
+                    Ok(()) => app.ok(if on { "Memory is on" } else { "Memory is off in every chat" }),
+                    Err(error) => app.fail(error.to_string()),
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete if count > 0 => {
+                match crate::memory::forget(&app.db, &(self.selected + 1).to_string()) {
+                    Ok(title) => app.ok(format!("Forgot {title}")),
+                    Err(error) => app.fail(error.to_string()),
+                }
+                self.selected = self.selected.min(count.saturating_sub(2));
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 // ------------------------------------------------------------------ tools
@@ -754,11 +882,10 @@ impl ToolsDialog {
 fn toggle_tool(app: &mut App, row: ToolRow) {
     if let ToolRow::Skill(id) = &row {
         let enabled = app.db.skills().unwrap_or_default().iter().find(|s| &s.id == id).map(|s| s.enabled);
-        if let Some(enabled) = enabled {
-            if let Err(error) = app.db.set_skill_enabled(id, !enabled) {
+        if let Some(enabled) = enabled
+            && let Err(error) = app.db.set_skill_enabled(id, !enabled) {
                 app.fail(error.to_string());
             }
-        }
         return;
     }
     let chat = match app.chat.clone() {
@@ -836,12 +963,24 @@ fn draw_mcp(dialog: &ListDialog, app: &App, buf: &mut Buffer, screen: Rect) {
     let first = window(dialog.selected, servers.len(), visible);
     for (offset, server) in servers.iter().skip(first).take(visible).enumerate() {
         let selected = first + offset == dialog.selected;
-        let (status, role) = if server.connected || !server.tools.is_empty() {
+        let ready = server.connected || !server.tools.is_empty();
+        let (status, role) = if server.auth == "oauth" && !crate::oauth::is_signed_in(&app.secrets, &server.id) {
+            ("! signed out · s to sign in".to_string(), Role::Warn)
+        } else if ready {
             let allowed = crate::mcp::server_always_allowed(&app.db, &server.id);
+            let how = if server.auth == "oauth" {
+                "signed in"
+            } else if crate::mcp_stdio::is_running(&server.id) {
+                "running"
+            } else {
+                "ready"
+            };
             (
-                if allowed { "✓ ready · runs without asking" } else { "✓ ready · asks before writing" }.to_string(),
+                format!("✓ {how} · {}", if allowed { "runs without asking" } else { "asks before writing" }),
                 Role::Accent,
             )
+        } else if server.transport == "stdio" {
+            ("! not started · r to start".to_string(), Role::Warn)
         } else {
             ("! not connected · r to retry".to_string(), Role::Warn)
         };
@@ -858,7 +997,7 @@ fn draw_mcp(dialog: &ListDialog, app: &App, buf: &mut Buffer, screen: Rect) {
         buf,
         inner.x,
         inner.bottom() - 1,
-        "a add · r refresh · k token · p ask/allow · x remove",
+        "a add · r refresh · s sign in · o sign out · k token · p ask/allow · x remove",
         t.fg(Role::Dim),
         inner.right(),
     );
@@ -884,6 +1023,24 @@ fn mcp_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
             if let Some(server) = selected {
                 app.dialog = Some(Dialog::Form(Form::mcp_token(&server.id, &server.name)));
                 return true;
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(server) = selected {
+                if server.transport == "stdio" {
+                    app.notify(Role::Dim, format!("{} runs on this computer and needs no sign-in", server.name));
+                } else {
+                    let _ = app.db.set_mcp_auth(&server.id, "oauth");
+                    crate::oauth::sign_out(&app.secrets, &server.id);
+                    refresh_mcp(app, server.id, server.name);
+                }
+            }
+        }
+        KeyCode::Char('o') => {
+            if let Some(server) = selected {
+                crate::oauth::sign_out(&app.secrets, &server.id);
+                let _ = app.db.mark_mcp_disconnected(&server.id);
+                app.ok(format!("Signed out of {}", server.name));
             }
         }
         KeyCode::Char('p') => {
@@ -915,14 +1072,28 @@ fn mcp_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
+/// Connect a server in the background, signing in through the browser when
+/// it needs that; esc in the chat cancels the wait for the browser.
 pub fn refresh_mcp(app: &mut App, id: String, name: String) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     app.busy_task = Some(format!("connecting to {name}"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.sign_in_cancel = Some(cancel.clone());
     let ctx = app.ctx.clone();
-    app.spawn_task(move || {
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        let mut opened = |_: &str| {
+            let _ = tx.send(super::app::WorkerMsg::Task(Task::McpSigningIn { name: name.clone() }));
+        };
         let result = crate::db::Database::open(&ctx.db_path)
-            .and_then(|db| crate::mcp::refresh(&db, &ctx.secrets, &id))
-            .map_err(|error| super::app::describe_error(&error));
-        Task::McpRefreshed { name, result }
+            .and_then(|db| crate::mcp::connect_server(&db, &ctx.secrets, &id, &cancel, &mut opened));
+        let task = match result {
+            Ok(count) => Task::McpRefreshed { name, result: Ok(count) },
+            Err(error) if crate::mcp::needs_sign_in(&error).is_some_and(|need| !need.browser) => Task::McpNeedsToken { id, name },
+            Err(error) => Task::McpRefreshed { name, result: Err(super::app::describe_error(&error)) },
+        };
+        let _ = tx.send(super::app::WorkerMsg::Task(task));
     });
 }
 
@@ -959,7 +1130,7 @@ fn draw_skills(dialog: &ListDialog, app: &App, buf: &mut Buffer, screen: Rect) {
         buf,
         inner.x,
         inner.bottom() - 1,
-        "space on/off · m when to use · a add · x remove · enter read",
+        "space on/off · m when to use · a add · r reload · x remove · enter read",
         t.fg(Role::Dim),
         inner.right(),
     );
@@ -977,11 +1148,10 @@ fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char(' ') => {
-            if let Some(skill) = selected {
-                if let Err(error) = app.db.set_skill_enabled(&skill.id, !skill.enabled) {
+            if let Some(skill) = selected
+                && let Err(error) = app.db.set_skill_enabled(&skill.id, !skill.enabled) {
                     app.fail(error.to_string());
                 }
-            }
         }
         KeyCode::Char('m') => {
             if let Some(skill) = selected {
@@ -994,6 +1164,15 @@ fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
                     Ok(()) => app.ok(format!("{}: {}", skill.name, skill_mode_label(next))),
                     Err(error) => app.fail(error.to_string()),
                 }
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(skill) = selected {
+                app.busy_task = Some(format!("reading {} again", skill.name));
+                app.spawn_task(move || Task::SkillLoaded {
+                    existing: Some(skill.id.clone()),
+                    result: crate::skills::reload(&skill.source).map_err(|e| format!("{}: {e:#}", skill.name)),
+                });
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
@@ -1009,16 +1188,19 @@ fn skills_key(dialog: &mut ListDialog, app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             if let Some(skill) = selected {
-                let mut lines = vec![
-                    Line::styled(skill.description.clone(), theme().fg(Role::Dim)),
-                    Line::default(),
-                ];
+                let files = app.db.skill_file_count(&skill.id).unwrap_or(0);
+                let mut about = skill.description.clone();
+                if files > 0 {
+                    about.push_str(&format!(" · {}", text::plural(files, "reference file", "reference files")));
+                }
+                let mut lines = vec![Line::styled(about, theme().fg(Role::Dim)), Line::default()];
                 lines.extend(crate::ui::markdown::render(
                     &skill.body,
                     crate::ui::markdown::MdOptions {
                         width: 76,
                         indent: 0,
                         block_indent: 2,
+                        wide: 76,
                     },
                 ));
                 app.dialog = Some(Dialog::Text(TextView {
@@ -1125,7 +1307,7 @@ impl Form {
                 Field::choice("Preset", PRESETS.to_vec(), 0),
                 Field::text("Name", "", "a name you will recognise"),
                 Field::text("Base URL", "", "ends in /v1"),
-                Field::secret("API key", "saved in your keychain", "leave empty if none"),
+                Field::secret("API key", crate::secrets::where_keys_go(false), "leave empty if none"),
                 Field::text("Headers", "", "none · Name: value, Name: value"),
             ],
             focus: 0,
@@ -1152,7 +1334,7 @@ impl Form {
         Self {
             title: format!("API key for {name}"),
             kind: FormKind::ProviderKey(id.into()),
-            fields: vec![Field::secret("API key", "saved in your keychain", "paste the key")],
+            fields: vec![Field::secret("API key", crate::secrets::where_keys_go(false), "paste the key")],
             focus: 0,
             status: None,
             testable: false,
@@ -1213,12 +1395,12 @@ impl Form {
 
     pub fn add_mcp() -> Self {
         Self {
-            title: "Add a remote MCP server".into(),
+            title: "Add an MCP server".into(),
             kind: FormKind::AddMcp,
             fields: vec![
                 Field::text("Name", "", "github"),
-                Field::text("URL", "", "https://…/mcp"),
-                Field::secret("Token", "saved in your keychain", "leave empty if none"),
+                Field::text("Address", "", "https://…/mcp, or a command: npx -y @scope/server"),
+                Field::secret("Token", crate::secrets::where_keys_go(false), "leave empty if none"),
             ],
             focus: 0,
             status: None,
@@ -1231,7 +1413,7 @@ impl Form {
         Self {
             title: format!("Access token for {name}"),
             kind: FormKind::McpToken(id.into()),
-            fields: vec![Field::secret("Token", "saved in your keychain", "paste the token")],
+            fields: vec![Field::secret("Token", crate::secrets::where_keys_go(false), "paste the token")],
             focus: 0,
             status: None,
             testable: false,
@@ -1243,7 +1425,7 @@ impl Form {
         Self {
             title: "Add a skill".into(),
             kind: FormKind::AddSkill,
-            fields: vec![Field::text("Folder", "", "a folder with SKILL.md, or a SKILL.md file")],
+            fields: vec![Field::text("Source", "", "a folder with SKILL.md, or a GitHub link to one")],
             focus: 0,
             status: None,
             testable: false,
@@ -1252,11 +1434,10 @@ impl Form {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if let Some(field) = self.fields.get_mut(self.focus) {
-            if !matches!(field.kind, FieldKind::Choice(..)) {
+        if let Some(field) = self.fields.get_mut(self.focus)
+            && !matches!(field.kind, FieldKind::Choice(..)) {
                 field.value.push_str(text.trim_end_matches(['\n', '\r']));
             }
-        }
     }
 
     pub fn set_test_result(&mut self, result: Result<(u64, Vec<String>), String>) {
@@ -1345,7 +1526,7 @@ impl Form {
             y += 1;
         }
         y += 1;
-        let x = put(buf, inner.x + 1, y, " Save ", t.badge(), inner.right());
+        let x = put(buf, inner.x, y, " Save ", t.badge(), inner.right());
         let rest = if self.testable { "   Test (ctrl+t)   Cancel (esc)" } else { "   Cancel (esc)" };
         let rest = if self.testable && self.status.is_some() { "   Test again (ctrl+t)   Cancel (esc)" } else { rest };
         put(buf, x, y, rest, t.fg(Role::Dim), inner.right());
@@ -1413,11 +1594,10 @@ impl Form {
             return;
         }
         let mut key = self.field("API key");
-        if key.is_empty() {
-            if let FormKind::EditProvider(id) = &self.kind {
+        if key.is_empty()
+            && let FormKind::EditProvider(id) = &self.kind {
                 key = app.secrets.provider_key(id).unwrap_or_default();
             }
-        }
         let headers = match parse_headers(&self.field("Headers")) {
             Ok(headers) => headers,
             Err(error) => {
@@ -1552,24 +1732,28 @@ impl Form {
                 app.db
                     .set_model_defaults(&provider_id, &model_id, &defaults)
                     .map_err(|e| e.to_string())?;
-                if let Some(chat) = app.chat.clone() {
-                    if chat.provider_id.as_deref() == Some(&provider_id) && chat.model_id.as_deref() == Some(&model_id) {
+                if let Some(chat) = app.chat.clone()
+                    && chat.provider_id.as_deref() == Some(&provider_id) && chat.model_id.as_deref() == Some(&model_id) {
                         let params = app.db.default_params(&provider_id, &model_id);
                         let _ = app.db.set_chat_params(&chat.id, &params);
                         app.reload_messages();
                     }
-                }
                 app.ok(format!("Saved defaults for {model_id}"));
                 Ok(true)
             }
             FormKind::AddMcp => {
                 let name = self.field("Name");
-                let url = self.field("URL");
-                if name.is_empty() || !url.starts_with("http") {
-                    return Err("Give it a name and an https:// URL".into());
+                let address = self.field("Address");
+                if name.is_empty() || address.is_empty() {
+                    return Err("Give it a name, and its https:// address or the command that runs it".into());
                 }
-                let id = app.db.add_mcp_server(&name, &url).map_err(|e| e.to_string())?;
+                if app.db.mcp_servers().unwrap_or_default().iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+                    return Err(format!("There is already a server named {name}"));
+                }
+                let transport = if address.starts_with("http://") || address.starts_with("https://") { "http" } else { "stdio" };
                 let token = self.field("Token");
+                let auth = if token.is_empty() { "none" } else { "token" };
+                let id = app.db.add_mcp_server(&name, &address, transport, auth).map_err(|e| e.to_string())?;
                 if !token.is_empty() {
                     app.secrets.set_mcp_token(&id, &token).map_err(|e| e.to_string())?;
                 }
@@ -1583,19 +1767,22 @@ impl Form {
                     return Err("Paste the token first".into());
                 }
                 app.secrets.set_mcp_token(&id, &token).map_err(|e| e.to_string())?;
+                let _ = app.db.set_mcp_auth(&id, "token");
                 let name = app.db.mcp_servers().unwrap_or_default().into_iter().find(|s| s.id == id).map(|s| s.name).unwrap_or_default();
                 refresh_mcp(app, id, name);
                 app.dialog = Some(Dialog::Mcp(ListDialog::default()));
                 Ok(false)
             }
             FormKind::AddSkill => {
-                let path = super::files::expand(&self.field("Folder"));
-                let (name, description, body, source, files) =
-                    crate::skills::read_skill_source(&path).map_err(|e| format!("{e:#}"))?;
-                app.db
-                    .save_skill_with_files(&name, &description, &body, &source, &files)
-                    .map_err(|e| e.to_string())?;
-                app.ok(format!("Added {name}"));
+                let source = self.field("Source");
+                if source.is_empty() {
+                    return Err("Give a folder with SKILL.md, or a GitHub link".into());
+                }
+                app.busy_task = Some("reading the skill".into());
+                app.spawn_task(move || Task::SkillLoaded {
+                    existing: None,
+                    result: crate::skills::load(&source).map_err(|e| format!("{e:#}")),
+                });
                 app.dialog = Some(Dialog::Skills(ListDialog::default()));
                 Ok(false)
             }
@@ -1622,15 +1809,19 @@ fn draw_choices(buf: &mut Buffer, x: u16, y: u16, right: u16, options: &[&str], 
         }
         first += 1;
     }
+    // "␣Custom␣  OpenRouter  Groq": the chosen one sits in a highlighted
+    // chip, the others are two spaces apart.
     let mut cursor = x;
     for (index, option) in options.iter().enumerate().skip(first) {
-        let label = format!(" {option} ");
+        let (label, style) = if index == chosen {
+            (format!(" {option} "), t.selected(Role::Accent))
+        } else {
+            (option.to_string(), t.fg(Role::Text))
+        };
         if cursor + width(&label) as u16 > right {
             break;
         }
-        let style = if index == chosen { t.selected(Role::Accent) } else { t.fg(Role::Text) };
-        cursor = put(buf, cursor, y, &label, style, right);
-        cursor = put(buf, cursor, y, " ", Style::default(), right);
+        cursor = put(buf, cursor, y, &label, style, right) + 2;
     }
 }
 
@@ -1730,7 +1921,7 @@ impl Confirm {
                         result.map(|_| "Removed · chats that used it stay")
                     }
                     ConfirmAction::RemoveMcp(id) => {
-                        let _ = app.secrets.delete(&format!("mcp.{id}"));
+                        crate::mcp::forget(&app.secrets, id);
                         app.dialog = Some(Dialog::Mcp(ListDialog::default()));
                         app.db.remove_mcp_server(id).map(|_| "Removed")
                     }
@@ -1825,16 +2016,21 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
     let mut option_rows = Vec::new();
     for (index, (label, key)) in options.iter().enumerate() {
         let selected = index == pending.selection;
-        let marker = if selected { "› " } else { "  " };
-        let style = if selected { t.selected(Role::Accent) } else { t.fg(Role::Text) };
-        option_rows.push((
+        // Laid out as the design draws it: the highlight ends three columns
+        // before the chosen key; the other keys sit one column further right.
+        let line = if selected {
             Line::from(vec![
-                Span::styled(format!(" {marker}{}", text::pad(label, 20)), style),
-                Span::raw(" "),
+                Span::styled(format!(" › {}", text::pad(label, 18)), t.selected(Role::Accent)),
+                Span::raw("   "),
+                Span::styled(key.to_string(), t.fg(Role::Text)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(format!("   {}", text::pad(label, 22)), t.fg(Role::Text)),
                 Span::styled(key.to_string(), t.fg(Role::Dim)),
-            ]),
-            selected,
-        ));
+            ])
+        };
+        option_rows.push((line, selected));
     }
     let kind = if request.writes { "MCP · writes data" } else { "MCP · reads data" };
     let g = t.glyphs();
@@ -1881,6 +2077,8 @@ pub fn draw(app: &App, buf: &mut Buffer, screen: Rect) {
         Some(Dialog::Form(form)) => form.draw(buf, screen),
         Some(Dialog::Confirm(confirm)) => confirm.draw(buf, screen),
         Some(Dialog::Text(view)) => view.draw(buf, screen),
+        Some(Dialog::Image(viewer)) => viewer.draw(app, buf, screen),
+        Some(Dialog::Memory(dialog)) => dialog.draw(app, buf, screen),
         None => {}
     }
 }
@@ -1902,9 +2100,16 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
         Dialog::Form(form) => form.key(app, key),
         Dialog::Confirm(confirm) => confirm.key(app, key),
         Dialog::Text(view) => view.key(key),
+        Dialog::Image(viewer) => viewer.key(app, key),
+        Dialog::Memory(dialog) => dialog.key(app, key),
     };
     if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);
+    }
+    if app.dialog.is_none()
+        && let Some(viewer) = app.pending_image.take()
+    {
+        app.dialog = Some(Dialog::Image(viewer));
     }
 }
 

@@ -643,32 +643,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn toggle_pin(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE chats SET pinned=1-pinned,updated_at=?1 WHERE id=?2",
-            params![now_ms(), id],
-        )?;
-        Ok(())
-    }
-
     pub fn delete_chat(&self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM messages WHERE chat_id=?1", [id])?;
         self.conn
             .execute("DELETE FROM rag_chunks WHERE chat_id=?1", [id])?;
         self.conn.execute("DELETE FROM chats WHERE id=?1", [id])?;
-        Ok(())
-    }
-
-    pub fn clear_chat(&self, id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM messages WHERE chat_id=?1", [id])?;
-        self.conn
-            .execute("DELETE FROM rag_chunks WHERE chat_id=?1", [id])?;
-        self.conn.execute(
-            "UPDATE chats SET title='New chat',title_locked=0,updated_at=?1 WHERE id=?2",
-            params![now_ms(), id],
-        )?;
         Ok(())
     }
 
@@ -747,17 +727,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_message_ui_spec(&self, message_id: &str, spec: &Value) -> Result<()> {
-        let updated = self.conn.execute(
-            "UPDATE messages SET ui_spec=?1 WHERE id=?2",
-            params![spec.to_string(), message_id],
-        )?;
-        if updated == 0 {
-            bail!("generated UI message no longer exists");
-        }
-        Ok(())
-    }
-
     pub fn prompts(&self) -> Result<Vec<Prompt>> {
         let mut stmt = self.conn.prepare("SELECT id,name,body,tags,favorite,preferred_model_id,tool_ids,variables FROM prompts ORDER BY favorite DESC,name")?;
         let rows = stmt.query_map([], |r| {
@@ -829,6 +798,12 @@ impl Database {
         save_skill_files(&tx, &id, files)?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Skills from GitHub follow their source when this is on.
+    pub fn set_skill_auto_update(&self, id: &str, on: bool) -> Result<()> {
+        self.conn.execute("UPDATE skills SET auto_update=?1 WHERE id=?2", params![on as i64, id])?;
+        Ok(())
     }
 
     pub fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -909,13 +884,20 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_mcp_server(&self, name: &str, url: &str) -> Result<String> {
+    /// A new server: `transport` is http (its address in `url`) or stdio
+    /// (the command line in `url`); `auth` is none, token or oauth.
+    pub fn add_mcp_server(&self, name: &str, url: &str, transport: &str, auth: &str) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO mcp_servers (id,name,url,transport,auth,tools,enabled_by_default,is_connector,connected) VALUES (?1,?2,?3,'http','none','[]',1,0,0)",
-            params![id, name, url],
+            "INSERT INTO mcp_servers (id,name,url,transport,auth,tools,enabled_by_default,is_connector,connected) VALUES (?1,?2,?3,?4,?5,'[]',1,0,0)",
+            params![id, name, url, transport, auth],
         )?;
         Ok(id)
+    }
+
+    pub fn set_mcp_auth(&self, id: &str, auth: &str) -> Result<()> {
+        self.conn.execute("UPDATE mcp_servers SET auth=?1 WHERE id=?2", params![auth, id])?;
+        Ok(())
     }
 
     pub fn update_mcp_tools(&self, id: &str, tools: &Value) -> Result<()> {
@@ -1172,12 +1154,28 @@ pub fn classify_model(id: &str, raw: &Value) -> Value {
     ]
     .iter()
     .any(|x| lower.contains(x));
-    json!({
+    let mut caps = json!({
         "kind": kind,
         "tools": kind == "chat",
         "vision": vision,
         "embeddings": kind == "embedding"
-    })
+    });
+    // Context window, as OpenRouter, vLLM, LM Studio and others report it.
+    let context = [
+        "/context_length",
+        "/max_context_length",
+        "/max_model_len",
+        "/context_window",
+        "/top_provider/context_length",
+        "/meta/n_ctx_train",
+    ]
+    .iter()
+    .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_u64))
+    .filter(|tokens| *tokens >= 1024);
+    if let Some(tokens) = context {
+        caps["contextK"] = json!(tokens.div_ceil(1024));
+    }
+    caps
 }
 
 /// Rebuild API-compatible assistant tool-call and tool-result messages from
@@ -1280,6 +1278,8 @@ mod tests {
         );
         assert_eq!(classify_model("flux.1-dev", &json!({}))["kind"], "image");
         assert_eq!(classify_model("gpt-4o", &json!({}))["kind"], "chat");
+        assert_eq!(classify_model("qwen3-32b", &json!({"context_length": 131072}))["contextK"], 128);
+        assert_eq!(classify_model("x", &json!({"max_model_len": 32768}))["contextK"], 32);
     }
 
     #[test]
@@ -1474,10 +1474,6 @@ mod tests {
         .unwrap();
         let saved = db.messages(&chat.id).unwrap();
         assert_eq!(saved[0].ui_spec.as_ref(), Some(&spec));
-        let mut updated = spec.clone();
-        updated["state"] = json!({"checked":true});
-        db.update_message_ui_spec(&saved[0].id, &updated).unwrap();
-        assert_eq!(db.messages(&chat.id).unwrap()[0].ui_spec, Some(updated));
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }

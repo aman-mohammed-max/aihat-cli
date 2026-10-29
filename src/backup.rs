@@ -281,7 +281,7 @@ mod tests {
         )
         .unwrap();
         let server_id = db
-            .add_mcp_server("test", "https://example.test/mcp")
+            .add_mcp_server("test", "https://example.test/mcp", "http", "none")
             .unwrap();
         db.conn
             .execute(

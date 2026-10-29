@@ -5,6 +5,8 @@ mod composer;
 mod dialogs;
 mod draw;
 mod files;
+mod images;
+mod keys;
 mod providers;
 mod tasks;
 mod transcript;
@@ -27,11 +29,20 @@ use std::time::{Duration, Instant};
 
 pub use app::describe_error;
 pub use dialogs::model_caps_long;
+pub use keys::parse_key;
 pub use tasks::test_endpoint;
 
 pub fn run(db: Database, paths: Paths, config: AppConfig, secrets: Secrets, initial_chat: Option<String>) -> Result<()> {
+    let problems = keys::init(&config.keys);
     let mut app = app::App::new(db, paths, config, secrets, initial_chat)?;
-    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if let Some(problem) = problems.first() {
+        app.notify(crate::ui::theme::Role::Warn, problem.clone());
+    }
+    // Asking the terminal whether it supports the keyboard protocol can
+    // stall for seconds on terminals that never answer, so the request is
+    // sent unconditionally; terminals without it ignore the sequence.
+    let enhanced = !cfg!(windows);
+    MOUSE.store(app.config.mouse, std::sync::atomic::Ordering::Relaxed);
     setup(enhanced)?;
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -40,10 +51,14 @@ pub fn run(db: Database, paths: Paths, config: AppConfig, secrets: Secrets, init
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, enhanced);
     restore(enhanced);
+    crate::mcp_stdio::stop(None);
     result
 }
+
+/// Mouse reporting is on (settings.json "mouse").
+static MOUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn setup(enhanced: bool) -> Result<()> {
     terminal::enable_raw_mode()?;
@@ -57,16 +72,27 @@ fn setup(enhanced: bool) -> Result<()> {
     )?;
     if enhanced {
         // Lets the terminal report shift+enter separately from enter.
-        execute!(
+        let _ = execute!(
             stdout,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
+        );
+    }
+    if MOUSE.load(std::sync::atomic::Ordering::Relaxed) {
+        // Clicks and the wheel only (no movement reports), in the SGR format.
+        // Shift+drag still selects text in most terminals.
+        use std::io::Write;
+        let _ = write!(stdout, "\x1b[?1000h\x1b[?1006h");
+        let _ = stdout.flush();
     }
     Ok(())
 }
 
 fn restore(enhanced: bool) {
     let mut stdout = io::stdout();
+    if MOUSE.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::io::Write;
+        let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l");
+    }
     if enhanced {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
@@ -74,7 +100,26 @@ fn restore(enhanced: bool) {
     let _ = terminal::disable_raw_mode();
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App) -> Result<()> {
+/// Hand the terminal to $VISUAL or $EDITOR for settings.json, then come back.
+fn edit_settings(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App, enhanced: bool) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "nano".into() });
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("nano").to_string();
+    let args: Vec<String> = parts.map(str::to_owned).collect();
+    restore(enhanced);
+    let status = std::process::Command::new(&program).args(&args).arg(&app.paths.config_file).status();
+    setup(enhanced)?;
+    terminal.clear()?;
+    match status {
+        Ok(_) => app.reload_settings(),
+        Err(error) => app.fail(format!("Could not open {program}: {error} · set EDITOR, or edit {}", crate::ui::text::home_relative(&app.paths.config_file))),
+    }
+    Ok(())
+}
+
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App, enhanced: bool) -> Result<()> {
     let mut dirty = true;
     let mut last_draw = Instant::now();
     loop {
@@ -92,16 +137,32 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
         if app.quit {
             return Ok(());
         }
+        if app.edit_settings {
+            app.edit_settings = false;
+            edit_settings(terminal, app, enhanced)?;
+            dirty = true;
+            continue;
+        }
         if event::poll(Duration::from_millis(40))? {
             // Handle everything that is waiting before drawing again, so a
             // paste or fast typing does not redraw once per character.
+            let mut changed = false;
             loop {
                 match event::read()? {
-                    Event::Key(key) => app.on_key(key),
-                    Event::Paste(text) => app.on_paste(&text),
+                    Event::Key(key) => {
+                        app.on_key(key);
+                        changed = true;
+                    }
+                    Event::Paste(text) => {
+                        app.on_paste(&text);
+                        changed = true;
+                    }
+                    // A click elsewhere changes nothing, so no redraw.
+                    Event::Mouse(mouse) => changed |= app.on_mouse(mouse),
                     Event::Resize(..) => {
                         app.cache.clear();
                         terminal.autoresize()?;
+                        changed = true;
                     }
                     _ => {}
                 }
@@ -109,7 +170,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
                     break;
                 }
             }
-            dirty = true;
+            dirty |= changed;
         }
         while let Ok(message) = app.rx.try_recv() {
             app.on_worker(message);

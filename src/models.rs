@@ -27,7 +27,7 @@ impl Model {
         self.caps
             .get("kind")
             .and_then(|x| x.as_str())
-            .map_or(true, |x| x == "chat")
+            .is_none_or(|x| x == "chat")
     }
 
     pub fn supports_tools(&self) -> bool {

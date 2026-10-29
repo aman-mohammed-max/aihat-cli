@@ -183,6 +183,15 @@ pub fn run(env: &mut Env, options: Options) -> Result<i32> {
         parsed.spec.as_ref(),
     )?;
     let number = env.db.chat_number(&chat.id).unwrap_or(0);
+    // Models without tools learn memories after the reply, as in the app.
+    if !cancelled
+        && let Some(note) = crate::memory::learn_from_turn(&env.db, &env.secrets, &chat, &provider, &model, &prompt, &output.content)
+        && std::io::stderr().is_terminal()
+        && !options.json
+    {
+        sink.finish_text();
+        eprintln!("{} {}", paint("◇", theme().fg(Role::Accent)), paint(&note, theme().fg(Role::Dim)));
+    }
 
     if options.json {
         let value = json!({
@@ -294,14 +303,25 @@ fn resolve(env: &Env, options: &Options, chat: Option<&Chat>) -> Result<(Provide
             }
             model
         }
-        None => crate::providers::resolve_provider_model(&env.db, Some(&provider.id), None)
-            .map(|(_, model)| model)
-            .map_err(|_| {
-                Failure::new(EXIT_ERROR, format!("{} has no chat models yet", provider.name)).detail(vec![
-                    Span::styled("Load them: ", theme().fg(Role::Dim)),
-                    Span::styled(format!("aihat models refresh {}", cli_name(&provider.name)), theme().fg(Role::Link)),
-                ])
-            })?,
+        None => match crate::providers::resolve_provider_model(&env.db, Some(&provider.id), None) {
+            Ok((_, model)) => model,
+            Err(_) => {
+                // The list may be stale or the server down: ask it, so a
+                // dead server is reported as unreachable, not as "no models".
+                if let Err(error) = crate::api::list_models(&provider, &env.secrets) {
+                    return Err(explain(env, &provider, "", options, error));
+                }
+                let _ = crate::providers::refresh_one(&env.db, &env.secrets, Some(&provider.id));
+                crate::providers::resolve_provider_model(&env.db, Some(&provider.id), None)
+                    .map(|(_, model)| model)
+                    .map_err(|_| {
+                        Failure::new(EXIT_ERROR, format!("{} has no chat models", provider.name)).detail(vec![
+                            Span::styled("Add one by name: ", theme().fg(Role::Dim)),
+                            Span::styled(format!("aihat models add MODEL -P {}", cli_name(&provider.name)), theme().fg(Role::Link)),
+                        ])
+                    })?
+            }
+        },
     };
     Ok((provider, model))
 }
@@ -404,7 +424,6 @@ fn server_hint(provider: &Provider) -> String {
 
 /// Prints progress while the turn runs.
 struct CliSink {
-    pretty: bool,
     status: bool,
     buffered: bool,
     yes: bool,
@@ -427,7 +446,6 @@ impl CliSink {
         let spinner = Spinner::new(status);
         spinner.set("Thinking…");
         Self {
-            pretty,
             status,
             buffered,
             yes,
@@ -451,6 +469,7 @@ impl CliSink {
             width: self.width.saturating_sub(1).clamp(20, PROSE_WIDTH),
             indent: 0,
             block_indent: 2,
+            wide: self.width.saturating_sub(1).max(20),
         }
     }
 
@@ -477,7 +496,8 @@ impl CliSink {
         parts.extend(self.tools_done.iter().cloned());
         if let Some(started) = self.reasoning_started.filter(|_| !self.reasoning_reported) {
             self.reasoning_reported = true;
-            parts.push(format!("Thought for {}", text::seconds(started.elapsed().as_millis() as u64)));
+            let ms = started.elapsed().as_millis() as u64;
+            parts.push(if ms < 1000 { "Thought".to_string() } else { format!("Thought for {}", text::seconds(ms)) });
         }
         if parts.is_empty() {
             return;
@@ -563,8 +583,13 @@ impl engine::Sink for CliSink {
     }
 
     fn text(&mut self, delta: &str) {
-        if !self.summary_printed && !delta.trim().is_empty() {
-            self.print_summary();
+        if !delta.trim().is_empty() {
+            if self.summary_printed {
+                // Words again after a tool: the spinner line goes.
+                self.spinner.stop();
+            } else {
+                self.print_summary();
+            }
         }
         if self.buffered {
             return;
@@ -574,6 +599,10 @@ impl engine::Sink for CliSink {
     }
 
     fn tool_started(&mut self, label: &ToolLabel) {
+        // Finish the words already on screen so the spinner gets its own line.
+        if !self.buffered {
+            self.flush_blocks(true);
+        }
         let what = if label.name == "web_search" {
             format!("Searching {}…", label.detail)
         } else {
@@ -599,6 +628,24 @@ impl engine::Sink for CliSink {
             });
         }
         self.spinner.set("Thinking…");
+    }
+
+    fn signing_in(&mut self, server: &str, url: &str) {
+        if !self.buffered {
+            self.flush_blocks(true);
+        }
+        self.spinner.stop();
+        if self.status {
+            let t = theme();
+            eprintln!("{} {server} needs you to sign in. Opening your browser…", paint("◇", t.fg(Role::Accent)));
+            eprintln!(
+                "{} {} {}",
+                paint("│", t.fg(Role::Dim)),
+                paint("If it doesn't open:", t.fg(Role::Dim)),
+                paint(&text::truncate(url, 80), t.fg(Role::Link))
+            );
+        }
+        self.spinner.set("Waiting for you to sign in…");
     }
 
     fn warning(&mut self, text: &str) {
@@ -647,14 +694,14 @@ impl engine::Sink for CliSink {
 }
 
 /// A one-line spinner on stderr: `⠋ Searching "fabric api"… 2s`.
-struct Spinner {
+pub(crate) struct Spinner {
     state: Arc<Mutex<Option<String>>>,
     enabled: bool,
     alive: Arc<AtomicBool>,
 }
 
 impl Spinner {
-    fn new(enabled: bool) -> Self {
+    pub(crate) fn new(enabled: bool) -> Self {
         let state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let alive = Arc::new(AtomicBool::new(true));
         if enabled {
@@ -665,8 +712,8 @@ impl Spinner {
                 let started = Instant::now();
                 let mut frame = 0;
                 while alive.load(Ordering::Relaxed) {
-                    if let Ok(guard) = state.lock() {
-                        if let Some(text) = guard.as_ref() {
+                    if let Ok(guard) = state.lock()
+                        && let Some(text) = guard.as_ref() {
                             let t = theme();
                             let line = format!(
                                 "\r\x1b[2K{} {} {}",
@@ -678,7 +725,6 @@ impl Spinner {
                             let _ = write!(err, "{line}");
                             let _ = err.flush();
                         }
-                    }
                     frame += 1;
                     std::thread::sleep(Duration::from_millis(90));
                 }
@@ -687,20 +733,19 @@ impl Spinner {
         Self { state, enabled, alive }
     }
 
-    fn set(&self, text: &str) {
+    pub(crate) fn set(&self, text: &str) {
         if let Ok(mut guard) = self.state.lock() {
             *guard = Some(text.to_string());
         }
     }
 
-    fn stop(&self) {
-        if let Ok(mut guard) = self.state.lock() {
-            if guard.take().is_some() && self.enabled {
+    pub(crate) fn stop(&self) {
+        if let Ok(mut guard) = self.state.lock()
+            && guard.take().is_some() && self.enabled {
                 let mut err = std::io::stderr().lock();
                 let _ = write!(err, "\r\x1b[2K");
                 let _ = err.flush();
             }
-        }
     }
 }
 

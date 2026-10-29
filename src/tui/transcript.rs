@@ -15,6 +15,7 @@
 use crate::engine::split_reasoning;
 use crate::models::Message;
 use crate::ui::markdown::{self, MdOptions, wrap_segments};
+use crate::ui::picture::{self, Picture};
 use crate::ui::text::{self, width};
 use crate::ui::theme::{Role, theme};
 use ratatui::style::Style;
@@ -23,6 +24,8 @@ use serde_json::Value;
 
 /// Prose never runs wider than this, even in very wide terminals.
 pub const MAX_TEXT_WIDTH: usize = 90;
+/// Under 100 columns prose wraps sooner, as in the small-terminal design.
+const NARROW_TEXT_WIDTH: usize = 60;
 
 #[derive(Clone, Copy)]
 pub struct Layout {
@@ -30,11 +33,14 @@ pub struct Layout {
     pub narrow: bool,
     pub show_reasoning: bool,
     pub show_stats: bool,
+    /// Draw small previews of pictures in the chat.
+    pub pictures: bool,
 }
 
 impl Layout {
     fn text_width(&self) -> usize {
-        self.width.saturating_sub(1).min(MAX_TEXT_WIDTH)
+        let max = if self.narrow { NARROW_TEXT_WIDTH } else { MAX_TEXT_WIDTH };
+        self.width.saturating_sub(1).min(max)
     }
 }
 
@@ -55,9 +61,42 @@ pub fn user_lines(message: &Message, layout: Layout) -> Vec<Line<'static>> {
                 text.push_str(&format!(" · {meta}"));
             }
             out.push(Line::styled(text::truncate(&text, layout.width), t.fg(Role::Dim)));
+            if let Some((rows, _)) = picture_rows(item, layout, 24, 8) {
+                out.extend(rows);
+            }
         }
     }
     out
+}
+
+/// A small preview of an attached or saved picture, indented under the
+/// message, and its description ("1024×1024 · PNG · 1.4 MB").
+fn picture_rows(item: &Value, layout: Layout, max_cols: u16, max_rows: u16) -> Option<(Vec<Line<'static>>, String)> {
+    if !layout.pictures || item.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let uri = item.get("uri").and_then(Value::as_str)?;
+    let picture = match uri.split_once("base64,") {
+        Some((_, data)) => {
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim()).ok()?;
+            Picture::decode(bytes).ok()?
+        }
+        None if uri.starts_with("http://") || uri.starts_with("https://") => return None,
+        None => Picture::open(std::path::Path::new(uri)).ok()?,
+    };
+    let (w, h) = image::GenericImageView::dimensions(&picture.image);
+    let max_cols = max_cols.min(layout.text_width().saturating_sub(3) as u16);
+    let (cols, rows) = picture::fit(w, h, max_cols, max_rows);
+    let lines = picture::blocks(&picture.image, cols, rows)?;
+    let indented = lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw("   ")];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect();
+    Some((indented, picture.describe()))
 }
 
 /// `marker` on the first row, body wrapped and indented under it.
@@ -126,20 +165,32 @@ pub fn assistant_lines(message: &Message, layout: Layout) -> Vec<Line<'static>> 
                 .and_then(Value::as_str)
                 .unwrap_or("image");
             let shown = if path.starts_with("data:") {
-                item.get("name").and_then(Value::as_str).unwrap_or("image")
+                item.get("name").and_then(Value::as_str).unwrap_or("image").to_string()
             } else {
-                path
+                text::home_relative(std::path::Path::new(path))
             };
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
             out.push(Line::from(vec![
                 Span::styled(" ● ", t.fg(Role::Accent)),
                 Span::styled("Saved ", t.fg(Role::Text)),
-                Span::styled(shown.to_string(), t.fg(Role::Link)),
+                Span::styled(shown, t.fg(Role::Link)),
             ]));
+            match picture_rows(item, layout, 28, 12) {
+                Some((rows, about)) => {
+                    out.extend(rows);
+                    out.push(Line::styled(format!("   {about}"), t.fg(Role::Dim)));
+                }
+                None if !path.starts_with("data:") && !std::path::Path::new(path).exists() => {
+                    out.push(Line::styled("   └ the file has been moved or deleted", t.fg(Role::Dim)));
+                }
+                None => {}
+            }
         }
     }
     let citations = message.citations.as_array().cloned().unwrap_or_default();
-    let stats = layout
-        .show_stats
+    let stats = (layout.show_stats && !layout.narrow)
         .then(|| stats_line(message.tokens, message.ms))
         .flatten();
     if !citations.is_empty() || stats.is_some() {
@@ -162,6 +213,7 @@ pub fn answer_lines(answer: &str, layout: Layout) -> Vec<Line<'static>> {
             width: layout.text_width(),
             indent: 3,
             block_indent: 0,
+            wide: layout.width.saturating_sub(1),
         },
     );
     mark_first(&mut lines, " ● ", theme().fg(Role::Accent));
@@ -173,28 +225,28 @@ pub fn mark_first(lines: &mut [Line<'static>], marker: &str, style: Style) {
     let Some(first) = lines.first_mut() else {
         return;
     };
-    if let Some(span) = first.spans.first_mut() {
-        if span.content.starts_with("   ") {
+    if let Some(span) = first.spans.first_mut()
+        && span.content.starts_with("   ") {
             let rest = span.content[3..].to_string();
             span.content = rest.into();
         }
-    }
     first.spans.insert(0, Span::styled(marker.to_string(), style));
 }
 
 pub fn reasoning_lines(reasoning: &str, label: &str, layout: Layout) -> Vec<Line<'static>> {
     let t = theme();
+    let key = super::keys::label(super::keys::Action::ToggleReasoning);
     let hint = if layout.show_reasoning {
-        "ctrl+o to hide"
+        format!("{key} to hide")
     } else {
-        "ctrl+o to show"
+        format!("{key} to show")
     };
     let mut out = vec![Line::from(vec![
         Span::styled(" ◇ ", t.fg(Role::Code)),
         Span::styled(format!("{label} · {hint}"), t.fg(Role::Dim)),
     ])];
     if layout.show_reasoning {
-        let segments = vec![(reasoning.trim().to_string(), t.fg(Role::Code))];
+        let segments = [(reasoning.trim().to_string(), t.fg(Role::Code))];
         for paragraph in segments[0].0.split("\n\n") {
             let rows = wrap_segments(
                 &[(paragraph.replace('\n', " "), t.fg(Role::Code))],
@@ -254,9 +306,13 @@ pub fn tool_lines(log: &Value, layout: Layout) -> Vec<Line<'static>> {
     ]
 }
 
-pub fn running_tool_lines(name: &str, detail: &str, elapsed_ms: u64, layout: Layout) -> Vec<Line<'static>> {
+pub fn running_tool_lines(name: &str, detail: &str, elapsed_ms: u64, waiting: bool, layout: Layout) -> Vec<Line<'static>> {
     let t = theme();
-    let summary = format!("running… {}", text::seconds(elapsed_ms));
+    let summary = if waiting {
+        "waiting for your answer".to_string()
+    } else {
+        format!("running… {}", text::seconds(elapsed_ms))
+    };
     if layout.narrow {
         return vec![Line::from(vec![
             Span::styled(" ● ", t.fg(Role::Warn)),
@@ -390,6 +446,7 @@ mod tests {
             narrow: false,
             show_reasoning: false,
             show_stats: true,
+            pictures: false,
         }
     }
 

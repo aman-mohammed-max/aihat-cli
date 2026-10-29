@@ -1,4 +1,5 @@
 use crate::api;
+use crate::api::SendRetry;
 use crate::config::{AppConfig, is_default_local_search_url, migrate_legacy_search_settings};
 use crate::db::Database;
 use crate::secrets::Secrets;
@@ -18,15 +19,6 @@ pub struct SearchOutput {
     pub pages_read: usize,
 }
 
-pub fn search(
-    db: &Database,
-    secrets: &Secrets,
-    config: &AppConfig,
-    query: &str,
-) -> Result<Vec<SearchHit>> {
-    Ok(search_with_metrics(db, secrets, config, query)?.hits)
-}
-
 pub fn search_with_metrics(
     db: &Database,
     secrets: &Secrets,
@@ -42,13 +34,13 @@ pub fn search_with_metrics(
     let configured_engine = settings
         .get("searchEngine")
         .and_then(Value::as_str)
-        .unwrap_or(&config.search_engine)
+        .unwrap_or(&config.search.engine)
         .trim()
         .to_lowercase();
     let configured_url = settings
         .get("searchUrl")
         .and_then(Value::as_str)
-        .unwrap_or(&config.search_url);
+        .unwrap_or(&config.search.url);
     // Keep the retired built-in endpoint from being called if a stale setting
     // survived migration or was loaded from an older config file.
     let engine = if configured_engine == "searxng" && is_default_local_search_url(configured_url) {
@@ -60,7 +52,7 @@ pub fn search_with_metrics(
         .get("searchResults")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(config.search_results)
+        .unwrap_or(config.search.results)
         .clamp(1, 20);
     let safe = settings
         .get("searchSafe")
@@ -256,12 +248,13 @@ fn is_http_url(url: &str) -> bool {
 }
 
 fn read_page(url: &str) -> Result<String> {
+    crate::api::tls_ready();
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .user_agent(concat!("AI-Hat-CLI/", env!("CARGO_PKG_VERSION")))
         .build()?
         .get(url)
-        .send()
+        .send_retry()
         .with_context(|| format!("reading page {url}"))?
         .error_for_status()?;
     let html = response.text()?;
@@ -340,14 +333,6 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
         .join("\n\n")
 }
 
-pub fn citations(hits: &[SearchHit]) -> Value {
-    json!(
-        hits.iter()
-            .map(|hit| json!({"title":hit.title,"url":hit.url,"snippet":hit.snippet}))
-            .collect::<Vec<_>>()
-    )
-}
-
 pub fn tool_definition() -> Value {
     json!({
         "type": "function",
@@ -367,7 +352,7 @@ pub fn tool_definition() -> Value {
 mod tests {
     use super::{
         grounded_response_results, normalize_hits, provider_supports_google_grounding,
-        search as run_search, strip_tags,
+        search_with_metrics as run_search, strip_tags,
     };
     use crate::config::{AppConfig, Paths, is_default_local_search_url};
     use crate::db::Database;
@@ -419,7 +404,7 @@ mod tests {
         let paths = Paths {
             data_dir: dir.clone(),
             db_file: dir.join("aihat.db"),
-            config_file: dir.join("config.toml"),
+            config_file: dir.join("settings.json"),
             keys_file: dir.join("keys.json"),
             downloads_dir: dir.join("Downloads"),
         };

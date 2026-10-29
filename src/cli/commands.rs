@@ -15,6 +15,10 @@ use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+fn terminal_width() -> usize {
+    crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).saturating_sub(1)
+}
+
 fn ok(message: impl AsRef<str>) {
     println!("{} {}", paint("✓", theme().fg(Role::Accent)), message.as_ref());
 }
@@ -135,7 +139,7 @@ pub fn providers(env: &mut Env, action: Option<ProviderAction>) -> Result<i32> {
         }
         ProviderAction::SetKey { name } => {
             let provider = find_provider(&env.db, &name)?;
-            let key = read_secret("API key", "saved in your system keychain")?;
+            let key = read_secret("API key", crate::secrets::where_keys_go(true))?;
             if key.is_empty() {
                 return Err(Failure::new(EXIT_USAGE, "The key is empty; nothing was saved").into());
             }
@@ -204,7 +208,7 @@ fn list_providers(env: &Env) -> Result<()> {
         };
         let (status, role) = match provider.status.as_str() {
             "online" | "ok" => (format!("✓ {}", provider.latency_ms.map(text::duration).unwrap_or_else(|| "ready".into())), Role::Accent),
-            "rejected" => ("✗ key rejected".to_string(), Role::Error),
+            "rejected" => ("✗ key rejected (401)".to_string(), Role::Error),
             "offline" => ("! offline".to_string(), Role::Warn),
             _ => ("· not tested".to_string(), Role::Dim),
         };
@@ -313,9 +317,10 @@ fn add_provider(
             for model in env.db.models(Some(&id))? {
                 env.db.set_model_enabled(&id, &model.id, wanted_models.contains(&model.id))?;
             }
+            let provider = env.db.provider(&id)?.context("the new provider was not saved")?;
             for model in &wanted_models {
                 if env.db.model(&id, model)?.is_none() {
-                    crate::providers::add_model(&env.db, &id, model, "chat", None)?;
+                    crate::providers::add_model(&env.db, &provider, model, None, "chat")?;
                 }
             }
         }
@@ -357,7 +362,7 @@ fn add_provider(
     };
     let key = match &key_env {
         Some(var) => std::env::var(var).unwrap_or_default(),
-        None => prompt::input("API key", "saved in your system keychain · leave empty if none", "", true)?,
+        None => prompt::input("API key", &format!("{} · leave empty if none", crate::secrets::where_keys_go(true)), "", true)?,
     };
     let tested = crate::tui::test_endpoint(&url, &key, &json!({}));
     let found = match &tested {
@@ -509,7 +514,7 @@ pub fn models(env: &mut Env, action: Option<ModelAction>, provider: Option<&str>
                 Some(name) => find_provider(&env.db, name)?,
                 None => env.db.default_provider()?.ok_or_else(|| Failure::new(EXIT_ERROR, "No provider yet"))?,
             };
-            crate::providers::add_model(&env.db, &provider.id, &model, &kind, name.as_deref())?;
+            crate::providers::add_model(&env.db, &provider, &model, name.as_deref(), &kind)?;
             ok(format!("Added {model} to {}", provider.name));
             Ok(0)
         }
@@ -683,11 +688,10 @@ pub enum ChatOutcome {
 /// A chat by number (`41`, `#41`), id, or id prefix.
 fn find_chat(db: &Database, id: &str) -> Result<crate::models::Chat> {
     let trimmed = id.trim_start_matches('#');
-    if let Ok(number) = trimmed.parse::<usize>() {
-        if let Some(chat) = db.chat_by_number(number)? {
+    if let Ok(number) = trimmed.parse::<usize>()
+        && let Some(chat) = db.chat_by_number(number)? {
             return Ok(chat);
         }
-    }
     db.chat(id)?
         .ok_or_else(|| Failure::new(EXIT_ERROR, format!("No chat {id}")).note("List them: aihat chats").into())
 }
@@ -731,7 +735,7 @@ pub fn chats(env: &mut Env, action: Option<ChatAction>) -> Result<ChatOutcome> {
                     "assistant" => {
                         let (_, answer) = crate::engine::split_reasoning(&message.content);
                         println!();
-                        let rows = crate::ui::markdown::render(&answer, crate::ui::markdown::MdOptions { width, indent: 0, block_indent: 2 });
+                        let rows = crate::ui::markdown::render(&answer, crate::ui::markdown::MdOptions { width, indent: 0, block_indent: 2, wide: terminal_width() });
                         print!("{}", crate::ui::ansi::lines(&rows));
                     }
                     _ => {}
@@ -805,7 +809,7 @@ fn redirected_to() -> Option<String> {
 pub enum McpAction {
     /// List MCP servers
     List,
-    /// Add a remote (HTTP) MCP server
+    /// Add a server: its URL, or a command after -- (npx, uvx, a program)
     Add {
         name: String,
         url: Option<String>,
@@ -815,6 +819,12 @@ pub enum McpAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Sign in with your browser
+    Login { name: String },
+    /// Sign out (the server stays)
+    Logout { name: String },
+    /// Start a command server and load its tools
+    Start { name: String },
     /// Reconnect and reload a server's tools
     Refresh { name: String },
     /// Save an access token for a server
@@ -835,6 +845,70 @@ fn find_mcp(env: &Env, name: &str) -> Result<crate::models::McpServer> {
         .ok_or_else(|| Failure::new(EXIT_ERROR, format!("No MCP server named \"{name}\"")).note("List them: aihat mcp").into())
 }
 
+/// Connect a server, signing in through the browser when it needs that, and
+/// print the outcome: `✓ Signed in · 21 tools added · ask before running: on`.
+fn connect_mcp(env: &mut Env, id: &str, name: &str, added: bool) -> Result<i32> {
+    let t = theme();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut signed_in = false;
+    let mut opened = |url: &str| {
+        signed_in = true;
+        eprintln!("{} {name} needs you to sign in. Opening your browser…", paint("◇", t.fg(Role::Accent)));
+        eprintln!("{} {} {}", paint("│", t.fg(Role::Dim)), dim("If it doesn't open:"), link(&text::truncate(url, terminal_width().saturating_sub(22).max(40))));
+    };
+    let result = crate::mcp::connect_server(&env.db, &env.secrets, id, &cancel, &mut opened);
+    let server = find_mcp(env, id)?;
+    match result {
+        Ok(count) => {
+            let asks = if crate::mcp::server_always_allowed(&env.db, id) { "off" } else { "on" };
+            let tools = text::plural(count, "tool", "tools");
+            if signed_in {
+                ok(format!("Signed in · {tools} added · {}", dim(&format!("ask before running: {asks}"))));
+            } else if added {
+                println!(
+                    "{} Added {name} {} · {tools} · {}",
+                    paint("✓", t.fg(Role::Accent)),
+                    dim(&format!("({})", server.transport)),
+                    dim(&format!("ask before running: {asks}"))
+                );
+            } else {
+                ok(format!("{name} · {tools}"));
+            }
+            Ok(0)
+        }
+        Err(error) => {
+            let prefix = if added { format!("Added {name}, but it did not connect") } else { format!("{name} did not connect") };
+            match crate::mcp::needs_sign_in(&error) {
+                Some(need) if !need.browser => {
+                    // A server that wants a pasted token: ask for it now.
+                    if prompt::interactive() {
+                        eprintln!("{} {name} needs an access token.", paint("◇", t.fg(Role::Accent)));
+                        let token = read_secret("Access token", crate::secrets::where_keys_go(true))?;
+                        if !token.is_empty() {
+                            env.secrets.set_mcp_token(id, &token)?;
+                            env.db.set_mcp_auth(id, "token")?;
+                            return connect_mcp(env, id, name, added);
+                        }
+                    }
+                    println!("{} {prefix}: it needs an access token.", paint("!", t.fg(Role::Warn)));
+                    println!("  {} {}", dim("Save it:"), link(&format!("aihat mcp set-key {name}")));
+                    Ok(EXIT_AUTH)
+                }
+                Some(_) => {
+                    println!("{} {prefix}: {}", paint("!", t.fg(Role::Warn)), crate::tui::describe_error(&error));
+                    Ok(EXIT_AUTH)
+                }
+                None => {
+                    let message = crate::tui::describe_error(&error);
+                    println!("{} {prefix}: {message}", paint("!", t.fg(Role::Warn)));
+                    let no_browser = message.contains("No web browser");
+                    Ok(if no_browser { EXIT_ERROR } else { EXIT_UNREACHABLE })
+                }
+            }
+        }
+    }
+}
+
 pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
     let t = theme();
     match action.unwrap_or(McpAction::List) {
@@ -844,64 +918,76 @@ pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
                 println!("No MCP servers yet. Add one: {}", link("aihat mcp add NAME https://…/mcp"));
                 return Ok(0);
             }
-            println!("{}", dim(&format!("  {}{}{}  STATUS", pad("NAME", 12), pad("TRANSPORT", 9), pad_left("TOOLS", 5))));
+            println!("{}", dim(&format!("  {}{}{}  STATUS", pad("NAME", 12), pad("TRANSPORT", 11), pad_left("TOOLS", 5))));
             for server in servers {
                 let allowed = crate::mcp::server_always_allowed(&env.db, &server.id);
-                let status = if server.connected || !server.tools.is_empty() {
-                    paint(&format!("✓ ready{}", if allowed { " · runs without asking" } else { "" }), t.fg(Role::Accent))
-                } else {
+                let ready = server.connected || !server.tools.is_empty();
+                let status = if server.auth == "oauth" && !crate::oauth::is_signed_in(&env.secrets, &server.id) {
+                    format!("{} {}", paint("! signed out ·", t.fg(Role::Warn)), link(&format!("aihat mcp login {}", server.name)))
+                } else if !ready && server.transport == "stdio" {
+                    format!("{} {}", paint("! not running ·", t.fg(Role::Warn)), link(&format!("aihat mcp start {}", server.name)))
+                } else if !ready {
                     format!("{} {}", paint("! not connected ·", t.fg(Role::Warn)), link(&format!("aihat mcp refresh {}", server.name)))
+                } else {
+                    let how = if server.auth == "oauth" { "signed in" } else { "ready" };
+                    paint(&format!("✓ {how}{}", if allowed { " · runs without asking" } else { "" }), t.fg(Role::Accent))
                 };
-                println!("  {}{}{}  {status}", strong(&pad(&server.name, 12)), pad(&server.transport, 9), pad_left(&server.tools.len().to_string(), 5));
+                println!("  {}{}{}  {status}", strong(&pad(&server.name, 12)), pad(&server.transport, 11), pad_left(&server.tools.len().to_string(), 5));
             }
             Ok(0)
         }
         McpAction::Add { name, url, token_env, command } => {
-            if !command.is_empty() || url.is_none() {
-                return Err(Failure::new(EXIT_USAGE, "Only remote (HTTP) MCP servers are supported in the terminal for now")
-                    .note("Give its URL: aihat mcp add NAME https://…/mcp")
-                    .into());
+            let (address, transport) = if !command.is_empty() {
+                (crate::mcp_stdio::command_line(&command), "stdio")
+            } else {
+                match url {
+                    Some(url) if url.starts_with("http://") || url.starts_with("https://") => (url, "http"),
+                    _ => {
+                        return Err(Failure::new(EXIT_USAGE, "Give the server's address, or the command that runs it after --")
+                            .note("aihat mcp add NAME https://…/mcp  ·  aihat mcp add NAME -- npx -y @scope/server")
+                            .into());
+                    }
+                }
+            };
+            if env.db.mcp_servers()?.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+                return Err(Failure::new(EXIT_USAGE, format!("There is already a server named \"{name}\"")).note("Pick another name, or remove it first: aihat mcp remove NAME").into());
             }
-            let url = url.unwrap_or_default();
-            let id = env.db.add_mcp_server(&name, &url)?;
+            let auth = if token_env.is_some() { "token" } else { "none" };
+            let id = env.db.add_mcp_server(&name, &address, transport, auth)?;
             if let Some(var) = token_env {
                 let token = std::env::var(&var).map_err(|_| Failure::new(EXIT_USAGE, format!("${var} is not set")))?;
                 env.secrets.set_mcp_token(&id, token.trim())?;
             }
-            match crate::mcp::refresh(&env.db, &env.secrets, &id) {
-                Ok(count) => {
-                    println!(
-                        "{} Added {name} {} · {} · {}",
-                        paint("✓", t.fg(Role::Accent)),
-                        dim("(http)"),
-                        text::plural(count, "tool", "tools"),
-                        dim("ask before running: on")
-                    );
-                    Ok(0)
-                }
-                Err(error) => {
-                    let auth = crate::api::api_error(&error).is_some_and(|e| e.kind == crate::api::ErrorKind::Auth);
-                    println!("{} Added {name}, but it did not connect: {}", paint("!", t.fg(Role::Warn)), crate::tui::describe_error(&error));
-                    if auth {
-                        println!("  {} {}", dim("Save its token:"), link(&format!("aihat mcp set-key {name}")));
-                    }
-                    Ok(if auth { EXIT_AUTH } else { EXIT_UNREACHABLE })
-                }
-            }
+            connect_mcp(env, &id, &name, true)
         }
-        McpAction::Refresh { name } => {
+        McpAction::Login { name } => {
             let server = find_mcp(env, &name)?;
-            let count = crate::mcp::refresh(&env.db, &env.secrets, &server.id)?;
-            ok(format!("{} · {}", server.name, text::plural(count, "tool", "tools")));
+            if server.transport == "stdio" {
+                return Err(Failure::new(EXIT_USAGE, format!("{} runs on this computer and needs no sign-in", server.name)).into());
+            }
+            env.db.set_mcp_auth(&server.id, "oauth")?;
+            crate::oauth::sign_out(&env.secrets, &server.id);
+            connect_mcp(env, &server.id, &server.name, false)
+        }
+        McpAction::Logout { name } => {
+            let server = find_mcp(env, &name)?;
+            crate::oauth::sign_out(&env.secrets, &server.id);
+            let _ = env.db.mark_mcp_disconnected(&server.id);
+            ok(format!("Signed out of {} · sign in again: {}", server.name, link(&format!("aihat mcp login {}", server.name))));
             Ok(0)
+        }
+        McpAction::Start { name } | McpAction::Refresh { name } => {
+            let server = find_mcp(env, &name)?;
+            connect_mcp(env, &server.id, &server.name, false)
         }
         McpAction::SetKey { name } => {
             let server = find_mcp(env, &name)?;
-            let token = read_secret("Access token", "saved in your system keychain")?;
+            let token = read_secret("Access token", crate::secrets::where_keys_go(true))?;
             if token.is_empty() {
                 return Err(Failure::new(EXIT_USAGE, "The token is empty; nothing was saved").into());
             }
             env.secrets.set_mcp_token(&server.id, &token)?;
+            env.db.set_mcp_auth(&server.id, "token")?;
             match crate::mcp::refresh(&env.db, &env.secrets, &server.id) {
                 Ok(count) => ok(format!("Token saved · {} ready", text::plural(count, "tool", "tools"))),
                 Err(error) => println!("{} Token saved, but: {}", paint("!", t.fg(Role::Warn)), crate::tui::describe_error(&error)),
@@ -925,7 +1011,7 @@ pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
             if !env.yes && !prompt::confirm(&format!("Remove {}?", server.name))? {
                 return Ok(0);
             }
-            let _ = env.secrets.delete(&format!("mcp.{}", server.id));
+            crate::mcp::forget(&env.secrets, &server.id);
             env.db.remove_mcp_server(&server.id)?;
             ok("Removed");
             Ok(0)
@@ -939,13 +1025,15 @@ pub fn mcp(env: &mut Env, action: Option<McpAction>) -> Result<i32> {
 pub enum SkillAction {
     /// List skills
     List,
-    /// Add a skill folder (with SKILL.md) or a SKILL.md file
-    Add { path: PathBuf },
+    /// Add a skill: a folder with SKILL.md, or a GitHub link to one
+    Add { source: String },
+    /// Read skills again from their folder or GitHub (all, or one)
+    Update { name: Option<String> },
     /// Turn a skill on
     Enable { name: String },
     /// Turn a skill off
     Disable { name: String },
-    /// Print a skill's instructions
+    /// Print a skill's instructions (also works with a GitHub link)
     Show { name: String },
     /// Remove a skill
     Remove { name: String },
@@ -978,11 +1066,48 @@ pub fn skills(env: &mut Env, action: Option<SkillAction>) -> Result<i32> {
             }
             Ok(0)
         }
-        SkillAction::Add { path } => {
-            let (name, description, body, source, files) = crate::skills::read_skill_source(&path)?;
-            env.db.save_skill_with_files(&name, &description, &body, &source, &files)?;
-            ok(format!("Added {name}"));
+        SkillAction::Add { source } => {
+            let spinner = super::ask::Spinner::new(std::io::stderr().is_terminal() && !std::path::Path::new(&source).exists());
+            spinner.set("Reading the skill…");
+            let loaded = crate::skills::load(&source);
+            spinner.stop();
+            let (name, description, body, source, files) = loaded.map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+            if env.db.skills()?.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+                return Err(Failure::new(EXIT_USAGE, format!("There is already a skill named {name}")).note(format!("Update it instead: aihat skills update {name}")).into());
+            }
+            let id = env.db.save_skill_with_files(&name, &description, &body, &source, &files)?;
+            let github = crate::skills::is_github(&source);
+            if github {
+                env.db.set_skill_auto_update(&id, true)?;
+            }
+            let extra = if files.is_empty() { String::new() } else { format!(" · {}", text::plural(files.len(), "file", "files")) };
+            ok(format!("Added {name}{extra}{}", if github { dim(" · from GitHub") } else { String::new() }));
             Ok(0)
+        }
+        SkillAction::Update { name } => {
+            let skills = match &name {
+                Some(name) => vec![find_skill(env, name)?],
+                None => env.db.skills()?.into_iter().filter(|s| s.source != "local" && !s.source.is_empty()).collect(),
+            };
+            if skills.is_empty() {
+                println!("No skills come from a folder or GitHub, so there is nothing to update.");
+                return Ok(0);
+            }
+            let mut failed = 0;
+            for skill in skills {
+                match crate::skills::reload(&skill.source) {
+                    Ok((new_name, description, body, source, files)) => {
+                        let changed = body != skill.body || description != skill.description;
+                        env.db.update_skill_source_with_files(&skill.id, &new_name, &description, &body, &source, &files)?;
+                        ok(format!("{new_name} {}", dim(if changed { "· updated" } else { "· already up to date" })));
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        println!("{} {}: {}", paint("✗", t.fg(Role::Error)), skill.name, format!("{error:#}"));
+                    }
+                }
+            }
+            Ok(if failed > 0 { EXIT_ERROR } else { 0 })
         }
         SkillAction::Enable { name } => {
             let skill = find_skill(env, &name)?;
@@ -997,11 +1122,35 @@ pub fn skills(env: &mut Env, action: Option<SkillAction>) -> Result<i32> {
             Ok(0)
         }
         SkillAction::Show { name } => {
-            let skill = find_skill(env, &name)?;
+            let skill = match find_skill(env, &name) {
+                Ok(skill) => skill,
+                // Not installed: read it from GitHub without adding it.
+                Err(error) => match crate::skills::parse_github(&name) {
+                    Some(found) if name.contains('/') => {
+                        let (skill_name, description, body, source, _) = crate::skills::fetch_github(&found, false)?;
+                        crate::models::Skill {
+                            id: String::new(),
+                            name: skill_name,
+                            description,
+                            version: String::new(),
+                            source,
+                            body,
+                            mode: "auto".into(),
+                            enabled: false,
+                            can_run_scripts: false,
+                            auto_update: false,
+                        }
+                    }
+                    _ => return Err(error),
+                },
+            };
             println!("{}", paint(&skill.name, t.bold(Role::Strong)));
             println!("{}", dim(&skill.description));
+            if !skill.source.is_empty() && skill.source != "local" {
+                println!("{}", dim(&format!("from {}", skill.source)));
+            }
             println!();
-            let rows = crate::ui::markdown::render(&skill.body, crate::ui::markdown::MdOptions { width: 78, indent: 0, block_indent: 2 });
+            let rows = crate::ui::markdown::render(&skill.body, crate::ui::markdown::MdOptions { width: 78, indent: 0, block_indent: 2, wide: terminal_width() });
             print!("{}", crate::ui::ansi::lines(&rows));
             Ok(0)
         }
@@ -1025,54 +1174,128 @@ pub enum ConfigAction {
     Path,
     /// Print one option, or all of them
     Get { key: Option<String> },
-    /// Change an option
+    /// Change an option, like keys.switch_model f2
     Set { key: String, value: String },
+    /// Open settings.json in your editor
+    Edit,
 }
 
 pub fn config(env: &mut Env, action: Option<ConfigAction>) -> Result<i32> {
     match action.unwrap_or(ConfigAction::Path) {
         ConfigAction::Path => {
-            println!("{}  {}", dim(&pad("Config", 9)), env.paths.config_file.display());
+            println!("{}  {}", dim(&pad("Settings", 9)), env.paths.config_file.display());
             println!("{}  {}", dim(&pad("Database", 9)), env.paths.db_file.display());
             println!("{}  {}", dim(&pad("Data", 9)), env.paths.data_dir.display());
             Ok(0)
         }
         ConfigAction::Get { key } => {
-            let value = toml::Value::try_from(&env.config)?;
+            let value = serde_json::to_value(&env.config)?;
             match key {
-                Some(key) => match value.get(&key) {
-                    Some(found) => println!("{}", found.to_string().trim_matches('"')),
-                    None => return Err(Failure::new(EXIT_USAGE, format!("Unknown option \"{key}\"")).note("See them all: aihat config get").into()),
-                },
-                None => print!("{}", toml::to_string_pretty(&env.config)?),
+                Some(key) => {
+                    let key = crate::config::canonical_key(&key);
+                    match lookup(&value, &key) {
+                        Some(Value::String(text)) => println!("{text}"),
+                        Some(found @ (Value::Object(_) | Value::Array(_))) => println!("{}", serde_json::to_string_pretty(found)?),
+                        Some(found) => println!("{found}"),
+                        None => return Err(unknown_option(&key).into()),
+                    }
+                }
+                None => println!("{}", serde_json::to_string_pretty(&value)?),
             }
             Ok(0)
         }
         ConfigAction::Set { key, value } => {
-            let mut next = env.config.clone();
-            let flag = |value: &str| -> Result<bool> {
-                match value.to_lowercase().as_str() {
-                    "true" | "on" | "yes" | "1" => Ok(true),
-                    "false" | "off" | "no" | "0" => Ok(false),
-                    _ => Err(Failure::new(EXIT_USAGE, format!("\"{value}\" is not on or off")).into()),
-                }
+            let key = crate::config::canonical_key(&key);
+            let mut settings = serde_json::to_value(&env.config)?;
+            let Some(slot) = lookup_mut(&mut settings, &key) else {
+                return Err(unknown_option(&key).into());
             };
-            match key.as_str() {
-                "theme" => next.theme = value.clone(),
-                "accent" => next.accent = value.clone(),
-                "no_color" => next.no_color = flag(&value)?,
-                "ascii" => next.ascii = flag(&value)?,
-                "show_stats" => next.show_stats = flag(&value)?,
-                "show_reasoning" => next.show_reasoning = flag(&value)?,
-                "search_url" => next.search_url = value.clone(),
-                "search_results" => next.search_results = value.parse().map_err(|_| Failure::new(EXIT_USAGE, "search_results is a number"))?,
-                "search_engine" => next.search_engine = value.clone(),
-                _ => return Err(Failure::new(EXIT_USAGE, format!("Unknown option \"{key}\"")).note("See them all: aihat config get").into()),
+            *slot = match &*slot {
+                Value::Bool(_) => Value::Bool(match value.to_lowercase().as_str() {
+                    "true" | "on" | "yes" | "1" => true,
+                    "false" | "off" | "no" | "0" => false,
+                    _ => return Err(Failure::new(EXIT_USAGE, format!("{key} is on or off, not \"{value}\"")).into()),
+                }),
+                Value::Number(_) => Value::Number(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| Failure::new(EXIT_USAGE, format!("{key} is a number, not \"{value}\"")))?
+                        .into(),
+                ),
+                Value::Object(_) => return Err(Failure::new(EXIT_USAGE, format!("{key} is a group; set one of its options, like {key}.{}", first_child(slot))).into()),
+                _ if key.starts_with("keys.") => {
+                    let keys: Vec<String> = value.split(',').map(|key| key.trim().to_string()).filter(|key| !key.is_empty()).collect();
+                    for one in &keys {
+                        crate::tui::parse_key(one).map_err(|error| Failure::new(EXIT_USAGE, error))?;
+                    }
+                    match keys.as_slice() {
+                        [one] => Value::String(one.clone()),
+                        _ => json!(keys),
+                    }
+                }
+                _ => Value::String(value.clone()),
+            };
+            let next: crate::config::AppConfig = serde_json::from_value(settings)?;
+            if let Some(problem) = check_setting(&next, &key) {
+                return Err(Failure::new(EXIT_USAGE, problem).into());
             }
             next.save(&env.paths)?;
             ok(format!("{key} = {value}"));
             Ok(0)
         }
+        ConfigAction::Edit => {
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "nano".into() });
+            let mut parts = editor.split_whitespace();
+            let program = parts.next().unwrap_or("nano");
+            let status = std::process::Command::new(program)
+                .args(parts)
+                .arg(&env.paths.config_file)
+                .status()
+                .map_err(|error| Failure::new(EXIT_ERROR, format!("Could not open {program}: {error}")).note("Set EDITOR, or edit the file at: aihat config path"))?;
+            if !status.success() {
+                return Ok(status.code().unwrap_or(1));
+            }
+            match crate::config::AppConfig::load(&env.paths) {
+                Ok(_) => ok("Saved settings.json"),
+                Err(error) => return Err(Failure::new(EXIT_ERROR, error.to_string()).note("Fix it with: aihat config edit").into()),
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn lookup<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    key.split('.').try_fold(value, |node, part| node.get(part))
+}
+
+fn lookup_mut<'a>(value: &'a mut Value, key: &str) -> Option<&'a mut Value> {
+    key.split('.').try_fold(value, |node, part| node.get_mut(part))
+}
+
+fn first_child(value: &Value) -> String {
+    value.as_object().and_then(|map| map.keys().next().cloned()).unwrap_or_default()
+}
+
+fn unknown_option(key: &str) -> Failure {
+    Failure::new(EXIT_USAGE, format!("Unknown option \"{key}\"")).note("See them all: aihat config get")
+}
+
+/// Values with a fixed set of choices.
+fn check_setting(config: &crate::config::AppConfig, key: &str) -> Option<String> {
+    let choose = |value: &str, allowed: &[&str]| {
+        (!allowed.contains(&value)).then(|| format!("{key} is one of {}, not \"{value}\"", allowed.join(", ")))
+    };
+    match key {
+        "colors" => choose(&config.colors, &["auto", "truecolor", "256", "16", "none"]),
+        "images.preview" => choose(&config.images.preview, &["auto", "kitty", "sixel", "iterm2", "blocks", "off"]),
+        "search.engine" => choose(&config.search.engine, &["provider", "brave", "tavily", "searxng"]),
+        "accent" => {
+            let hex = config.accent.trim_start_matches('#');
+            (hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("accent is a colour like \"#C6F46B\", not \"{}\"", config.accent))
+        }
+        _ => None,
     }
 }
 
@@ -1080,7 +1303,16 @@ pub fn config(env: &mut Env, action: Option<ConfigAction>) -> Result<i32> {
 pub enum MemoryAction {
     /// List saved memories
     List,
-    /// Turn memory on for new chats
+    /// Save a memory by hand
+    Add {
+        text: String,
+        /// A short label (made from the text when left out)
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Forget one memory: its number, or its title
+    Forget { which: String },
+    /// Turn memory on
     On,
     /// Turn memory off
     Off,
@@ -1094,23 +1326,40 @@ pub fn memory(env: &mut Env, action: Option<MemoryAction>) -> Result<i32> {
     if !settings.is_object() {
         settings = json!({});
     }
-    match action.unwrap_or(MemoryAction::List) {
+    let action = action.unwrap_or(MemoryAction::List);
+    match action {
         MemoryAction::List => {
             let enabled = settings.get("memoryEnabled").and_then(Value::as_bool).unwrap_or(true);
-            let items = settings.get("memoryItems").and_then(Value::as_array).cloned().unwrap_or_default();
+            let items = crate::memory::list(&env.db);
             println!(
                 "{} {}",
                 if enabled { paint("✓ Memory is on", t.fg(Role::Accent)) } else { paint("○ Memory is off", t.fg(Role::Dim)) },
-                dim(&format!("· {} saved", items.len()))
+                dim(&format!("· {} saved · shared by every chat", items.len()))
             );
-            for item in items {
-                let title = item.get("title").and_then(Value::as_str).unwrap_or("Untitled");
-                let body = item.get("text").and_then(Value::as_str).unwrap_or("");
-                println!("  {}  {}", strong(title), dim(&text::truncate(body, 70)));
+            let title_width = items.iter().map(|(_, title, _)| width(title)).max().unwrap_or(0).min(28);
+            for (index, (_, title, body)) in items.iter().enumerate() {
+                let room = terminal_width().saturating_sub(title_width + 10).max(20);
+                println!(
+                    "  {}  {}  {}",
+                    dim(&pad_left(&(index + 1).to_string(), 2)),
+                    strong(&pad(&text::truncate(title, title_width), title_width)),
+                    dim(&text::truncate(body, room))
+                );
+            }
+            if items.is_empty() {
+                println!("  {}", dim("Nothing yet. Models save what's worth keeping as you chat; or: aihat memory add \"I work in Rust\""));
             }
         }
+        MemoryAction::Add { text: body, title } => {
+            let title = crate::memory::add(&env.db, title.as_deref().unwrap_or(""), &body).map_err(|e| Failure::new(EXIT_USAGE, e.to_string()))?;
+            ok(format!("Saved to memory: {title}"));
+        }
+        MemoryAction::Forget { which } => {
+            let title = crate::memory::forget(&env.db, &which).map_err(|e| Failure::new(EXIT_USAGE, e.to_string()).note("See them: aihat memory"))?;
+            ok(format!("Forgot {title}"));
+        }
         MemoryAction::On | MemoryAction::Off => {
-            let on = matches!(action, Some(MemoryAction::On));
+            let on = matches!(action, MemoryAction::On);
             settings["memoryEnabled"] = json!(on);
             env.db.set_kv("settings", &settings.to_string())?;
             ok(if on { "Memory is on" } else { "Memory is off" });
@@ -1119,10 +1368,7 @@ pub fn memory(env: &mut Env, action: Option<MemoryAction>) -> Result<i32> {
             if !env.yes && !prompt::confirm("Forget every saved memory?")? {
                 return Ok(0);
             }
-            settings["memoryItems"] = json!([]);
-            let revision = settings.get("memoryRevision").and_then(Value::as_u64).unwrap_or(0);
-            settings["memoryRevision"] = json!(revision + 1);
-            env.db.set_kv("settings", &settings.to_string())?;
+            crate::memory::clear(&env.db)?;
             ok("Forgot every saved memory");
         }
     }
@@ -1183,7 +1429,7 @@ pub fn search_key(env: &mut Env, action: Option<SearchKeyAction>) -> Result<i32>
     };
     if set {
         let key = if std::io::stdin().is_terminal() {
-            prompt::input(&format!("{engine} API key"), "saved in your system keychain", "", true)?
+            prompt::input(&format!("{engine} API key"), crate::secrets::where_keys_go(true), "", true)?
         } else {
             std::env::var(env_name).map_err(|_| Failure::new(EXIT_USAGE, format!("Set ${env_name} or run this in a terminal")))?
         };
@@ -1199,24 +1445,98 @@ pub fn search_key(env: &mut Env, action: Option<SearchKeyAction>) -> Result<i32>
     Ok(0)
 }
 
-pub fn image(env: &mut Env, prompt_text: &str, provider: Option<&str>, model: Option<&str>, count: Option<usize>) -> Result<i32> {
+pub fn image(env: &mut Env, prompt_text: &str, provider: Option<&str>, model: Option<&str>, count: Option<usize>, output: Option<&str>) -> Result<i32> {
+    use crate::ui::picture::{self, Picture};
     if prompt_text.trim().is_empty() {
         return Err(Failure::new(EXIT_USAGE, "Describe the picture: aihat image \"a lighthouse in a storm\"").into());
     }
+    let t = theme();
+    let spinner = super::ask::Spinner::new(std::io::stderr().is_terminal());
+    spinner.set("Drawing…");
+    let started = std::time::Instant::now();
     let images = crate::imagegen::generate(&env.db, &env.secrets, prompt_text, provider, model, count)?;
-    if images.is_empty() {
+    let ms = started.elapsed().as_millis() as u64;
+    let pictures = images
+        .iter()
+        .map(|image| crate::imagegen::picture_bytes(image).and_then(Picture::decode))
+        .collect::<Result<Vec<_>>>()?;
+    spinner.stop();
+    if pictures.is_empty() {
         return Err(Failure::new(EXIT_ERROR, "The image service returned no pictures").into());
     }
-    std::fs::create_dir_all(&env.paths.downloads_dir)?;
+    let label = crate::imagegen::engine_label(&env.db);
+    let mut about = text::plural(pictures.len(), "picture", "pictures").replacen("1 picture", "a picture", 1);
+    if !label.is_empty() {
+        about.push_str(&format!(" · {label}"));
+    }
+    eprintln!("{} Drew {about} · {}", paint("✓", t.fg(Role::Accent)), dim(&text::duration(ms)));
+
+    let folder = env.config.image_folder(&env.paths);
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    for (index, image) in images.iter().enumerate() {
-        if let Some(data) = image.get("b64_json").and_then(Value::as_str) {
-            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())?;
-            let path = env.paths.downloads_dir.join(format!("aihat-{stamp}-{}.png", index + 1));
-            std::fs::write(&path, bytes)?;
-            ok(format!("Saved {}", text::home_relative(&path)));
-        } else if let Some(url) = image.get("url").and_then(Value::as_str) {
-            println!("{url}");
+    let ask = output.is_none() && !env.yes && prompt::interactive() && std::io::stdout().is_terminal();
+    let save = |picture: &Picture, path: &std::path::Path| -> Result<()> {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).with_context(|| format!("making {}", text::home_relative(parent)))?;
+        }
+        std::fs::write(path, &picture.bytes).with_context(|| format!("saving {}", text::home_relative(path)))?;
+        if std::io::stdout().is_terminal() {
+            ok(format!("Saved {}", text::home_relative(path)));
+        } else {
+            // Scripts get the path.
+            println!("{}", path.display());
+        }
+        Ok(())
+    };
+    let total = pictures.len();
+    for (index, picture) in pictures.iter().enumerate() {
+        let suffix = if total > 1 { format!("-{}", index + 1) } else { String::new() };
+        let name = format!("aihat-{stamp}{suffix}.{}", picture.extension());
+        if !ask {
+            let path = match output {
+                Some(target) => {
+                    let path = picture::save_as_target(target, &name, picture.extension());
+                    // Several pictures and one file name: number them.
+                    match (total > 1, path.file_stem(), path.extension()) {
+                        (true, Some(stem), Some(extension)) if path.file_name() != Some(std::ffi::OsStr::new(&name)) => path.with_file_name(format!(
+                            "{}{suffix}.{}",
+                            stem.to_string_lossy(),
+                            extension.to_string_lossy()
+                        )),
+                        _ => path,
+                    }
+                }
+                None => picture::unique_path(&folder, &name),
+            };
+            save(picture, &path)?;
+            continue;
+        }
+        let max_cols = (terminal_width().saturating_sub(4)).min(36) as u16;
+        println!();
+        let shown = picture::print(picture, &env.config.images.preview, 2, max_cols, 16);
+        println!("  {}", dim(&picture.describe()));
+        if !shown {
+            println!("  {}", dim("No preview in this terminal · images.preview in settings.json picks how"));
+        }
+        println!();
+        let title = if total > 1 { format!("Save picture {} of {total}?", index + 1) } else { "Save it?".to_string() };
+        let save_here = format!("Save to {}", text::home_relative(&folder));
+        match prompt::choose(&title, &[&save_here, "Save as…", "Discard"], 0)? {
+            0 => save(picture, &picture::unique_path(&folder, &name))?,
+            1 => {
+                let mut initial = text::home_relative(&folder.join(&name));
+                loop {
+                    let typed = prompt::input("Save as", "a file name or a folder", &initial, false)?;
+                    let path = picture::save_as_target(&typed, &name, picture.extension());
+                    if path.exists() {
+                        eprintln!("{} {} already exists · choose another name", paint("!", t.fg(Role::Warn)), text::home_relative(&path));
+                        initial = typed;
+                        continue;
+                    }
+                    save(picture, &path)?;
+                    break;
+                }
+            }
+            _ => eprintln!("{}", dim("○ Not saved")),
         }
     }
     Ok(0)

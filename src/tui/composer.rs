@@ -21,6 +21,7 @@ impl Composer {
         self.text.is_empty()
     }
 
+    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -28,11 +29,6 @@ impl Composer {
     pub fn set(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
-    }
-
-    pub fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
     }
 
     pub fn clear(&mut self) {

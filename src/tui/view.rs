@@ -3,8 +3,9 @@
 
 use super::app::{ActiveTurn, App, Page, Popup};
 use super::draw::{self, put, put_line};
+use super::keys::{self, Action};
 use super::transcript::{self, Layout};
-use crate::ui::text::{self, line_width, width};
+use crate::ui::text::{self, width};
 use crate::ui::theme::{Role, theme};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -15,11 +16,11 @@ use std::rc::Rc;
 pub struct Command {
     pub name: &'static str,
     pub description: &'static str,
-    pub shortcut: &'static str,
+    pub shortcut: Option<Action>,
     pub takes_args: bool,
 }
 
-const fn command(name: &'static str, description: &'static str, shortcut: &'static str, takes_args: bool) -> Command {
+const fn command(name: &'static str, description: &'static str, shortcut: Option<Action>, takes_args: bool) -> Command {
     Command {
         name,
         description,
@@ -29,26 +30,36 @@ const fn command(name: &'static str, description: &'static str, shortcut: &'stat
 }
 
 pub const COMMANDS: &[Command] = &[
-    command("model", "switch model", "ctrl+p", false),
-    command("prompt", "pick a system prompt", "ctrl+s", false),
-    command("providers", "list, add, test endpoints", "", false),
-    command("tools", "web search, image, MCP tools for this chat", "", false),
-    command("mcp", "MCP servers and sign-in", "", false),
-    command("skills", "turn skills on or off", "", false),
-    command("new", "start a new chat", "ctrl+n", false),
-    command("resume", "open a past chat", "ctrl+r", false),
-    command("compact", "summarise to free context", "", false),
-    command("export", "save as Markdown or JSON", "", false),
-    command("image", "improve a prompt, then draw", "", true),
-    command("search", "search the web, then answer", "", true),
-    command("refresh", "reload models from your providers", "", false),
-    command("rename", "rename this chat", "", true),
-    command("copy", "copy the last reply", "ctrl+y", false),
-    command("clear", "clear the screen", "ctrl+l", false),
-    command("memory", "turn memory on or off for this chat", "", false),
-    command("keys", "show every key", "?", false),
-    command("quit", "leave aihat", "ctrl+c ×2", false),
+    command("model", "switch model", Some(Action::SwitchModel), false),
+    command("prompt", "pick a system prompt", Some(Action::SwitchPrompt), false),
+    command("providers", "list, add, test endpoints", None, false),
+    command("tools", "web search, image, MCP tools for this chat", None, false),
+    command("mcp", "MCP servers and sign-in", None, false),
+    command("skills", "turn skills on or off", None, false),
+    command("new", "start a new chat", Some(Action::NewChat), false),
+    command("resume", "open a past chat", Some(Action::PastChats), false),
+    command("compact", "summarise to free context", None, false),
+    command("export", "save as Markdown or JSON", None, false),
+    command("image", "improve a prompt, then draw", None, true),
+    command("search", "search the web, then answer", None, true),
+    command("refresh", "reload models from your providers", None, false),
+    command("rename", "rename this chat", None, true),
+    command("copy", "copy the last reply", Some(Action::CopyReply), false),
+    command("clear", "clear the screen", Some(Action::ClearScreen), false),
+    command("memory", "what models remember · on or off for this chat", None, false),
+    command("keys", "show every key", Some(Action::ShowKeys), false),
+    command("settings", "open settings.json", None, false),
+    command("quit", "leave aihat", Some(Action::Quit), false),
 ];
+
+/// "ctrl+p", or "ctrl+c ×2" for quit.
+fn shortcut_label(command: &Command) -> String {
+    match command.shortcut {
+        Some(Action::Quit) => format!("{} ×2", keys::label(Action::Quit)),
+        Some(action) => keys::label(action).to_string(),
+        None => String::new(),
+    }
+}
 
 /// Commands matching what is typed after `/`: prefix matches first, then
 /// fuzzy matches on the name and description.
@@ -79,10 +90,17 @@ pub fn matching_commands(input: &str) -> Vec<&'static Command> {
 }
 
 pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
-    let area = frame.area();
-    app.width = area.width;
+    let screen = frame.area();
     let buf = frame.buffer_mut();
-    draw::fill(buf, area, theme().base());
+    draw::fill(buf, screen, theme().base());
+    // The design is a 112-column window; wider terminals get it centred.
+    let max = app.config.width;
+    let area = if max >= 80 && screen.width > max {
+        Rect::new(screen.x + (screen.width - max) / 2, screen.y, max, screen.height)
+    } else {
+        screen
+    };
+    app.width = area.width;
     if area.width < 40 || area.height < 10 {
         put(buf, 0, 0, "Make the terminal at least 80×24.", theme().fg(Role::Warn), area.right());
         return;
@@ -112,7 +130,7 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
         }
     }
     if app.dialog.is_some() {
-        draw::dim(buf, area);
+        draw::dim(buf, screen);
         super::dialogs::draw(app, buf, area);
     }
 }
@@ -127,13 +145,6 @@ fn draw_header(app: &App, buf: &mut Buffer, area: Rect) {
         Span::raw(" "),
         Span::styled("◆ AI Hat", t.bold(Role::Accent)),
     ];
-    if !narrow(area) {
-        left.push(Span::raw(" "));
-        left.push(Span::styled(
-            format!("{} · {}", env!("CARGO_PKG_VERSION"), text::current_dir_label()),
-            t.fg(Role::Dim),
-        ));
-    }
     let selection = app.current_selection();
     let mut right = Vec::new();
     let welcome = matches!(app.page, Page::Chat) && app.is_welcome();
@@ -148,6 +159,16 @@ fn draw_header(app: &App, buf: &mut Buffer, area: Rect) {
         }
     }
     right.push(Span::raw(" "));
+    if !narrow(area) {
+        let version = format!("{} · ", env!("CARGO_PKG_VERSION"));
+        let right_width: usize = right.iter().map(|s| width(&s.content)).sum();
+        let room = (area.width as usize).saturating_sub(10 + width(&version) + right_width + 2);
+        left.push(Span::raw(" "));
+        left.push(Span::styled(
+            format!("{version}{}", text::truncate_left(&text::current_dir_label(), room)),
+            t.fg(Role::Dim),
+        ));
+    }
     let line = text::spread(left, right, area.width as usize);
     put_line(buf, area.x, area.y, &line, area.right());
     draw::rule(buf, area.x, area.y + 1, area.width, t.fg(Role::Dim));
@@ -206,11 +227,11 @@ fn draw_welcome(app: &App, buf: &mut Buffer, area: Rect) {
         ]),
         Line::from(vec![
             bullet(),
-            c("ctrl+p"),
+            c(keys::label(Action::SwitchModel)),
             p(" switches model, "),
-            c("ctrl+s"),
+            c(keys::label(Action::SwitchPrompt)),
             p(" switches system prompt, "),
-            c("?"),
+            c(keys::label(Action::ShowKeys)),
             p(" shows every key"),
         ]),
         Line::from(vec![
@@ -229,8 +250,8 @@ fn draw_welcome(app: &App, buf: &mut Buffer, area: Rect) {
     let block = (area.width as usize).min(80) as u16;
     let block_right = area.x + block;
     put_line(buf, area.x + 2, y, &Line::styled("Recent chats", t.fg(Role::Strong)), right);
-    let hint = "ctrl+r for all";
-    put(buf, block_right - width(hint) as u16, y, hint, t.fg(Role::Dim), right);
+    let hint = format!("{} for all", keys::label(Action::PastChats));
+    put(buf, block_right - width(&hint) as u16, y, &hint, t.fg(Role::Dim), right);
     let chats = app.db.chats(false).unwrap_or_default();
     if chats.is_empty() {
         put(buf, area.x + 4, y + 1, "No chats yet. Ask anything below.", t.fg(Role::Dim), right);
@@ -255,7 +276,10 @@ fn draw_transcript(app: &mut App, buf: &mut Buffer, area: Rect) {
     let blocks = app.transcript_blocks();
     let mut rows: Vec<&Line<'static>> = Vec::new();
     let blank = Line::default();
-    rows.push(&blank);
+    // Small terminals start the chat right under the header.
+    if !narrow(area) {
+        rows.push(&blank);
+    }
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
             rows.push(&blank);
@@ -275,10 +299,21 @@ fn draw_transcript(app: &mut App, buf: &mut Buffer, area: Rect) {
     for (offset, line) in rows[start..].iter().take(height).enumerate() {
         put_line(buf, area.x, area.y + offset as u16, line, area.right());
     }
+    app.jump_button = None;
     if app.scroll > 0 {
-        let hint = format!(" ↓ {} more · pgdn · end ", app.scroll);
-        let x = area.right().saturating_sub(width(&hint) as u16 + 1);
-        put(buf, x, area.bottom() - 1, &hint, theme().selected(Role::Dim), area.right());
+        // A button back to the newest message; click it or press end.
+        let t = theme();
+        let pill = t.selected(Role::Text);
+        let below = text::plural(app.scroll, "line", "lines");
+        let label = format!(" ↓ Jump to bottom · {below} below   end ");
+        let w = width(&label) as u16;
+        let x = area.right().saturating_sub(w + 1);
+        let y = area.bottom() - 1;
+        let mut cursor = put(buf, x, y, " ↓ ", pill.fg(t.color(Role::Accent)), area.right());
+        cursor = put(buf, cursor, y, "Jump to bottom", pill, area.right());
+        cursor = put(buf, cursor, y, &format!(" · {below} below   "), pill.fg(t.color(Role::Dim)), area.right());
+        put(buf, cursor, y, "end ", pill.fg(t.color(Role::Dim)), area.right());
+        app.jump_button = Some(Rect::new(x, y, w, 1));
     }
 }
 
@@ -290,13 +325,30 @@ pub fn turn_blocks(turn: &ActiveTurn, layout: Layout) -> Vec<Rc<Vec<Line<'static
     for (label, started, log) in &turn.tools {
         match log {
             Some(log) => tools.extend(transcript::tool_lines(log, layout)),
+            // The approval box below already says what is waiting.
+            None if turn.approval.is_some() => {}
             None => tools.extend(transcript::running_tool_lines(
                 &label.name,
                 &label.detail,
                 started.elapsed().as_millis() as u64,
+                turn.approval.is_some(),
                 layout,
             )),
         }
+    }
+    if let Some((server, since)) = &turn.signing_in {
+        tools.push(Line::from(vec![
+            Span::styled(" ● ", t.fg(Role::Warn)),
+            Span::styled(format!("{server} · sign in"), t.fg(Role::Dim)),
+        ]));
+        tools.push(Line::styled(
+            format!(
+                "   └ waiting for you to sign in, in your browser · {} cancels · {}",
+                keys::label(Action::Stop),
+                text::seconds(since.elapsed().as_millis() as u64)
+            ),
+            t.fg(Role::Dim),
+        ));
     }
     if !tools.is_empty() {
         blocks.push(Rc::new(tools));
@@ -304,7 +356,7 @@ pub fn turn_blocks(turn: &ActiveTurn, layout: Layout) -> Vec<Rc<Vec<Line<'static
     let mut body = Vec::new();
     let elapsed = turn.started.elapsed().as_millis() as u64;
     let answering = !turn.content.trim().is_empty();
-    let waiting_on_tool = turn.tools.iter().any(|(_, _, log)| log.is_none()) || turn.approval.is_some();
+    let waiting_on_tool = turn.tools.iter().any(|(_, _, log)| log.is_none()) || turn.approval.is_some() || turn.signing_in.is_some();
     if !turn.reasoning.trim().is_empty() {
         let label = match turn.reasoning_ms {
             Some(ms) => format!("Thought for {}", text::seconds(ms)),
@@ -320,7 +372,7 @@ pub fn turn_blocks(turn: &ActiveTurn, layout: Layout) -> Vec<Rc<Vec<Line<'static
     if answering {
         let mut answer = transcript::answer_lines(&turn.content, layout);
         // The block cursor that shows the reply is still arriving.
-        if let Some(last) = answer.last_mut() {
+        if let Some(last) = answer.last_mut().filter(|_| turn.approval.is_none()) {
             last.spans.push(Span::styled(" ", t.cursor()));
         }
         body.extend(answer);
@@ -340,23 +392,26 @@ fn composer_height(app: &App) -> u16 {
     rows as u16 + 2
 }
 
-fn placeholder(app: &App, narrow: bool) -> &'static str {
+fn placeholder(app: &App, narrow: bool) -> String {
     if let Page::Providers(_) = app.page {
-        return "/providers · esc back to chat";
+        return "/providers · esc back to chat".into();
     }
     if let Some(turn) = &app.turn {
         if turn.approval.is_some() {
-            return "Waiting for your answer…";
+            return "Waiting for your answer…".into();
         }
-        return "Streaming… esc to stop";
+        if turn.signing_in.is_some() {
+            return "Waiting for you to sign in, in your browser…".into();
+        }
+        return format!("Streaming… {} to stop", keys::label(Action::Stop));
     }
     if app.busy_task.is_some() {
-        return "Working… you can keep typing";
+        return "Working… you can keep typing".into();
     }
     if narrow {
-        "Ask anything · / commands"
+        "Ask anything · / commands".into()
     } else {
-        "Ask anything · / commands · @ attach a file · ! run a shell command"
+        "Ask anything · / commands · @ attach a file · ! run a shell command".into()
     }
 }
 
@@ -375,7 +430,7 @@ fn draw_composer(app: &App, buf: &mut Buffer, area: Rect) {
         if active || app.dialog.is_none() && matches!(app.page, Page::Chat) && app.turn.is_none() {
             // The cursor sits at the start of an empty box.
         }
-        put(buf, text_x, y, hint, t.fg(Role::Dim), right);
+        put(buf, text_x, y, &hint, t.fg(Role::Dim), right);
         return;
     }
     let cols = app.composer_cols();
@@ -410,9 +465,19 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
         Some(notice) => Line::styled(notice.text.clone(), t.fg(notice.role)),
         None => match (&app.page, narrow) {
             (Page::Providers(_), _) => Line::styled("↑↓ move · tab switch pane · a add · t test · d default · esc back", dim),
-            (_, true) => Line::styled("? keys · ctrl+p model", dim),
-            _ if app.editing_last.is_some() => Line::styled("enter resend · esc cancel the edit", dim),
-            _ => Line::styled("enter send · shift+enter line · esc stop · ctrl+p model · ? keys", dim),
+            (_, true) => Line::styled(format!("{} keys · {} model", keys::label(Action::ShowKeys), keys::label(Action::SwitchModel)), dim),
+            _ if app.editing_last.is_some() => Line::styled(format!("{} resend · esc cancel the edit", keys::label(Action::Send)), dim),
+            _ => Line::styled(
+                format!(
+                    "{} send · {} line · {} stop · {} model · {} keys",
+                    keys::label(Action::Send),
+                    keys::label(Action::NewLine),
+                    keys::label(Action::Stop),
+                    keys::label(Action::SwitchModel),
+                    keys::label(Action::ShowKeys)
+                ),
+                dim,
+            ),
         },
     };
     let mut right: Vec<Span> = Vec::new();
@@ -436,7 +501,7 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
         Page::Chat => {
             let context = context_label(app, narrow);
             if let Some(turn) = &app.turn {
-                let state = if turn.approval.is_some() { "● waiting for you" } else { "● streaming" };
+                let state = if turn.approval.is_some() || turn.signing_in.is_some() { "● waiting for you" } else { "● streaming" };
                 right.push(Span::styled(state, t.fg(Role::Warn)));
                 if !context.is_empty() {
                     right.push(Span::styled(format!(" · {context}"), dim));
@@ -448,15 +513,16 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
                     .current_selection()
                     .and_then(|(provider, _)| provider.latency_ms)
                     .filter(|_| !narrow)
-                    .map(|ms| format!(" · {}", text::duration(ms)))
-                    .unwrap_or_default();
-                right.push(Span::styled(format!("{context}{latency}"), dim));
+                    .map(text::duration);
+                let parts: Vec<String> = [Some(context), latency].into_iter().flatten().filter(|p| !p.is_empty()).collect();
+                right.push(Span::styled(parts.join(" · "), dim));
             }
         }
     }
     right.push(Span::raw(" "));
     let mut left_spans = vec![Span::raw(" ")];
-    left_spans.extend(left.spans);
+    let left_style = left.style;
+    left_spans.extend(left.spans.into_iter().map(|span| Span::styled(span.content, left_style.patch(span.style))));
     let line = text::spread(left_spans, right, area.width as usize);
     put_line(buf, area.x, area.y, &line, area.right());
 }
@@ -481,8 +547,10 @@ fn context_label(app: &App, narrow: bool) -> String {
             .and_then(|m| m.context_k())
     });
     match limit {
+        Some(k) if used == 0 => format!("{k}k context"),
         Some(k) if narrow => format!("{}/{}k", text::compact(used), k),
         Some(k) => format!("{} / {}k", text::compact(used), k),
+        None if used == 0 => String::new(),
         None => format!("{} tokens", text::compact(used)),
     }
 }
@@ -513,7 +581,7 @@ fn draw_commands(app: &App, buf: &mut Buffer, chat: Rect) {
             Span::styled(text::pad(&format!("/{}", command.name), 13), name_style),
             Span::styled(command.description, t.fg(Role::Text)),
         ];
-        let right = vec![Span::styled(command.shortcut, if selected { t.fg(Role::Text) } else { t.fg(Role::Dim) })];
+        let right = vec![Span::styled(shortcut_label(command), if selected { t.fg(Role::Text) } else { t.fg(Role::Dim) })];
         let line = text::spread(left, right, inner.width as usize);
         draw::row(buf, inner, inner.y + offset as u16, line, selected);
     }
@@ -535,7 +603,9 @@ fn draw_attach(app: &mut App, buf: &mut Buffer, chat: Rect) {
     for (index, found) in matches.iter().enumerate() {
         let selected = index == selection;
         let path_style = if selected { t.fg(Role::Accent) } else { t.fg(Role::Text) };
+        // As in the design, the other rows sit two columns in from the chosen one.
         let line = Line::from(vec![
+            Span::raw(if selected { "" } else { "  " }),
             Span::styled(text::pad(&found.path, 34), path_style),
             Span::styled(text::pad(&found.size, 11), path_style),
             Span::styled(format!("· {}", found.modified), if selected { path_style } else { t.fg(Role::Dim) }),
@@ -545,11 +615,7 @@ fn draw_attach(app: &mut App, buf: &mut Buffer, chat: Rect) {
     let tail = if matches.is_empty() {
         "no matching files · also: a URL like @https://example.com"
     } else {
-        "also: a URL, an image (attached for models that can see)"
+        "also: a URL, an image (shown inline where the terminal supports it)"
     };
-    put(buf, inner.x, inner.y + matches.len() as u16, tail, t.fg(Role::Dim), inner.right());
-}
-
-pub fn line_cols(line: &Line<'_>) -> u16 {
-    line_width(line) as u16
+    put(buf, inner.x + 2, inner.y + matches.len() as u16, tail, t.fg(Role::Dim), inner.right());
 }

@@ -22,6 +22,9 @@ pub struct MdOptions {
     pub indent: usize,
     /// Extra columns before top-level lists and code blocks.
     pub block_indent: usize,
+    /// Columns code blocks and tables may use: usually the whole terminal,
+    /// since wrapped code is hard to read.
+    pub wide: usize,
 }
 
 pub fn render(markdown: &str, options: MdOptions) -> Vec<Line<'static>> {
@@ -301,7 +304,7 @@ impl Renderer {
                     code.text.push_str(&text);
                 } else {
                     let style = self.style();
-                    self.push_text_with_citations(&text, style);
+                    self.inline.push((text.to_string(), style));
                 }
             }
             Event::Code(text) => {
@@ -336,35 +339,6 @@ impl Renderer {
         }
     }
 
-    /// Plain text with `[1]`-style citations picked out in the link colour.
-    fn push_text_with_citations(&mut self, text: &str, style: Style) {
-        let link = theme().fg(Role::Link);
-        let bytes = text.as_bytes();
-        let mut last = 0;
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'[' {
-                let digits = bytes[index + 1..]
-                    .iter()
-                    .take_while(|byte| byte.is_ascii_digit())
-                    .count();
-                let close = index + 1 + digits;
-                if digits > 0 && digits < 4 && bytes.get(close) == Some(&b']') {
-                    if last < index {
-                        self.inline.push((text[last..index].to_string(), style));
-                    }
-                    self.inline.push((text[index..=close].to_string(), link));
-                    index = close + 1;
-                    last = index;
-                    continue;
-                }
-            }
-            index += 1;
-        }
-        if last < text.len() {
-            self.inline.push((text[last..].to_string(), style));
-        }
-    }
 
     /// Columns used by the current indentation and prefixes.
     fn prefix_width(&self) -> usize {
@@ -381,6 +355,10 @@ impl Renderer {
 
     fn available(&self) -> usize {
         self.options.width.saturating_sub(self.prefix_width()).max(8)
+    }
+
+    fn available_wide(&self) -> usize {
+        self.options.wide.max(self.options.width).saturating_sub(self.prefix_width()).max(8)
     }
 
     /// Build this row's prefix. The first row of a list item shows its marker.
@@ -424,7 +402,7 @@ impl Renderer {
         if self.inline.is_empty() || self.table.is_some() {
             return;
         }
-        let segments = std::mem::take(&mut self.inline);
+        let segments = cite(std::mem::take(&mut self.inline));
         if segments.iter().all(|(text, _)| text.trim().is_empty()) {
             return;
         }
@@ -443,7 +421,7 @@ impl Renderer {
         let top_level = self.prefixes.is_empty();
         let lead = if top_level { self.options.block_indent } else { 0 };
         let gutter = number_width + 3;
-        let available = self.available().saturating_sub(lead + gutter).max(8);
+        let available = self.available_wide().saturating_sub(lead + gutter).max(8);
         let mut highlighter = CodeHighlighter::new(&code.language);
         let bar = t.glyphs().vertical;
         for (index, line) in lines.iter().enumerate() {
@@ -478,7 +456,7 @@ impl Renderer {
                 widths[index] = widths[index].max(width(plain(cell).trim()));
             }
         }
-        let available = self.available().saturating_sub(self.options.block_indent);
+        let available = self.available_wide().saturating_sub(self.options.block_indent);
         let separators = 3 * (columns - 1);
         while widths.iter().sum::<usize>() + separators > available {
             let Some((widest, _)) = widths.iter().enumerate().max_by_key(|(_, w)| **w) else {
@@ -547,6 +525,51 @@ impl Renderer {
         }
         self.out
     }
+}
+
+/// Merge neighbouring pieces of the same style, then pick out `[1]`-style
+/// citations in the link colour. Merging first matters: the parser hands
+/// over `[`, `1` and `]` as separate pieces because they look like a link.
+fn cite(segments: Vec<(String, Style)>) -> Vec<(String, Style)> {
+    let t = theme();
+    let link = t.fg(Role::Link);
+    let code = [t.fg(Role::Link), t.fg(Role::Warn)];
+    let mut merged: Vec<(String, Style)> = Vec::new();
+    for (text, style) in segments {
+        match merged.last_mut() {
+            Some((last, last_style)) if *last_style == style && text != "\n" && last != "\n" => last.push_str(&text),
+            _ => merged.push((text, style)),
+        }
+    }
+    let mut out = Vec::new();
+    for (text, style) in merged {
+        if code.contains(&style) || !text.contains('[') {
+            out.push((text, style));
+            continue;
+        }
+        let bytes = text.as_bytes();
+        let (mut last, mut index) = (0, 0);
+        while index < bytes.len() {
+            if bytes[index] == b'[' {
+                let digits = bytes[index + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let close = index + 1 + digits;
+                if (1..4).contains(&digits) && bytes.get(close) == Some(&b']') {
+                    if last < index {
+                        out.push((text[last..index].to_string(), style));
+                    }
+                    out.push((text[index..=close].to_string(), link));
+                    index = close + 1;
+                    last = index;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        if last < text.len() {
+            out.push((text[last..].to_string(), style));
+        }
+    }
+    out
 }
 
 /// Greedy word wrap over styled segments. `\n` segments force a break.
@@ -701,6 +724,7 @@ mod tests {
         width: 90,
         indent: 3,
         block_indent: 0,
+        wide: 90,
     };
 
     #[test]
@@ -723,10 +747,20 @@ mod tests {
 
     #[test]
     fn citations_use_the_link_colour() {
-        let rows = render("See [1] and [2].", TUI);
-        let spans = &rows[0].spans;
+        let pieces = vec![
+            ("See ".to_string(), Style::default()),
+            ("[".to_string(), Style::default()),
+            ("1".to_string(), Style::default()),
+            ("] and [22], not [x].".to_string(), Style::default()),
+        ];
         let link = theme().fg(Role::Link);
-        assert!(spans.iter().any(|span| span.content == "[1]" && span.style == link));
+        let segments = cite(pieces);
+        let cited: Vec<&str> = segments
+            .iter()
+            .filter(|(_, style)| *style == link)
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(cited, vec!["[1]", "[22]"]);
     }
 
     #[test]
@@ -738,6 +772,7 @@ mod tests {
                 width: 80,
                 indent: 0,
                 block_indent: 2,
+                wide: 80,
             },
         ));
         assert_eq!(

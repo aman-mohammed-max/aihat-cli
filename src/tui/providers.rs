@@ -51,13 +51,6 @@ impl ProvidersPage {
     }
 }
 
-fn selected(app: &App) -> Option<Provider> {
-    let Page::Providers(page) = &app.page else {
-        return None;
-    };
-    app.db.providers().unwrap_or_default().into_iter().nth(page.selection)
-}
-
 /// All models of a provider, enabled ones first, chat models before others.
 fn provider_models(db: &Database, provider_id: &str) -> Vec<Model> {
     let mut models = db.models(Some(provider_id)).unwrap_or_default();
@@ -79,8 +72,8 @@ pub fn test_provider(app: &mut App, id: &str) {
 
 pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     // Asking the keychain can be slow, so key locations are cached.
-    if let Page::Providers(page) = &mut app.page {
-        if page.refresh_keys {
+    if let Page::Providers(page) = &mut app.page
+        && page.refresh_keys {
             page.keys = app
                 .db
                 .providers()
@@ -93,7 +86,6 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
                 .collect();
             page.refresh_keys = false;
         }
-    }
     let Page::Providers(page) = &app.page else {
         return;
     };
@@ -120,7 +112,7 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
             status_label(provider)
         };
         let marker = if provider.is_default { "● " } else { "  " };
-        let name_width = (inner.width as usize).saturating_sub(2 + 18).max(8);
+        let name_width = (inner.width as usize).saturating_sub(2 + 17).max(8);
         let line = if is_selected {
             Line::from(vec![
                 Span::styled(marker, t.fg(Role::Accent)),
@@ -155,8 +147,8 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     };
     let models = provider_models(&app.db, &provider.id);
     let max_height = area.bottom().saturating_sub(top);
-    let model_rows = models.len().max(1).min(max_height.saturating_sub(11) as usize).max(1);
-    let height = (model_rows as u16 + 11).min(max_height);
+    let model_rows = models.len().max(1).min(max_height.saturating_sub(10) as usize).max(1);
+    let height = (model_rows as u16 + 10).min(max_height);
     let detail = Rect::new(right_x, top, right_width, height);
     let border = if page.models_focused { t.fg(Role::Accent) } else { t.fg(Role::Dim) };
     draw::boxed(buf, detail, border, "Details", "r refresh models");
@@ -184,7 +176,7 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     y += 2;
     put(buf, inner.x, y, "Models in the picker", t.fg(Role::Strong), inner.right());
     let hint = "space toggles";
-    put(buf, inner.right().saturating_sub(width(hint) as u16 + 4), y, hint, t.fg(Role::Dim), inner.right());
+    put(buf, inner.right().saturating_sub(width(hint) as u16 + 8), y, hint, t.fg(Role::Dim), inner.right());
     y += 1;
     if models.is_empty() {
         put(buf, inner.x, y, "No models yet · r loads them from the endpoint", t.fg(Role::Dim), inner.right());
@@ -245,14 +237,14 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     put(buf, edit_x, y, edit, t.fg(Role::Dim), inner.right());
 }
 
-/// "✓ 38 ms", "✗ key rejected", "! offline", "· not tested".
+/// "✓ 38 ms", "✗ 401" (the key was rejected), "! offline", "· not tested".
 pub fn status_label(provider: &Provider) -> (String, Role) {
     match provider.status.as_str() {
         "online" | "ok" => (
             format!("✓ {}", provider.latency_ms.map(text::duration).unwrap_or_else(|| "ready".into())),
             Role::Accent,
         ),
-        "rejected" => ("✗ key rejected".into(), Role::Error),
+        "rejected" => ("✗ 401".into(), Role::Error),
         "offline" => ("! offline".into(), Role::Warn),
         _ => ("· not tested".into(), Role::Dim),
     }
@@ -271,12 +263,10 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.page = Page::Chat;
-            return;
         }
         KeyCode::Char('/') => {
             app.page = Page::Chat;
             app.composer.set("/");
-            return;
         }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
             if provider.is_some() {

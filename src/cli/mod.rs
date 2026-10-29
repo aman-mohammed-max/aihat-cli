@@ -105,6 +105,9 @@ enum Top {
         prompt: Vec<String>,
         #[arg(long, short = 'n')]
         count: Option<usize>,
+        /// Save here without asking (a file or a folder)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
 }
 
@@ -153,13 +156,16 @@ impl std::error::Error for Failure {}
 
 /// Run the command line and return the exit code.
 pub fn main() -> i32 {
-    match run() {
+    let code = match run() {
         Ok(code) => code,
         Err(error) => {
             report(&error);
             exit_code(&error)
         }
-    }
+    };
+    // MCP programs started for this run end with it.
+    crate::mcp_stdio::stop(None);
+    code
 }
 
 fn report(error: &anyhow::Error) {
@@ -213,7 +219,7 @@ fn run() -> Result<i32> {
     let args = match Cli::try_parse() {
         Ok(args) => args,
         Err(error) => {
-            init_theme(false, false, None);
+            init_theme(false, false, None, "auto");
             if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp) {
                 print_help();
                 return Ok(0);
@@ -234,8 +240,19 @@ fn run() -> Result<i32> {
         }
     };
     let paths = Paths::resolve(args.db_path.clone())?;
-    let config = AppConfig::load(&paths)?;
-    init_theme(args.no_color || config.no_color, args.ascii || config.ascii, Some(&config.accent));
+    let config = match AppConfig::load(&paths) {
+        Ok(config) => config,
+        // `aihat config` still works with a broken settings.json, so it can be fixed.
+        Err(error) if matches!(args.command, Some(Top::Config(_))) => {
+            eprintln!("! {error}");
+            AppConfig::default()
+        }
+        Err(error) => {
+            init_theme(args.no_color, args.ascii, None, "auto");
+            return Err(Failure::new(EXIT_ERROR, error.to_string()).note("Fix it with: aihat config edit").into());
+        }
+    };
+    init_theme(args.no_color, args.ascii || config.ascii, Some(&config.accent), &config.colors);
     if args.version {
         println!("aihat {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
@@ -272,7 +289,7 @@ fn run() -> Result<i32> {
         Some(Top::Memory(sub)) => commands::memory(&mut env, sub.action),
         Some(Top::Backup(sub)) => commands::backup(&mut env, sub.action),
         Some(Top::SearchKey(sub)) => commands::search_key(&mut env, sub.action),
-        Some(Top::Image { prompt, count }) => commands::image(&mut env, &prompt.join(" "), provider.as_deref(), args.model.as_deref(), count),
+        Some(Top::Image { prompt, count, output }) => commands::image(&mut env, &prompt.join(" "), provider.as_deref(), args.model.as_deref(), count, output.as_deref()),
         None => {
             let prompt = args.prompt.join(" ");
             let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -314,14 +331,20 @@ fn open_tui(env: Env, chat: Option<String>) -> Result<i32> {
     Ok(0)
 }
 
-fn init_theme(no_color: bool, ascii: bool, accent: Option<&str>) {
-    let depth = theme::detect_depth(supports_color::Stream::Stdout, no_color);
-    let depth = if depth == theme::Depth::None && std::io::stdout().is_terminal() && !no_color && std::env::var_os("NO_COLOR").is_none() {
+fn init_theme(no_color: bool, ascii: bool, accent: Option<&str>, colors: &str) {
+    let depth = theme::detect_depth(supports_color::Stream::Stdout, no_color, colors);
+    let depth = if depth == theme::Depth::None
+        && std::io::stdout().is_terminal()
+        && !no_color
+        && colors != "none"
+        && std::env::var_os("NO_COLOR").is_none()
+    {
         theme::Depth::Ansi16
     } else {
         depth
     };
     theme::init(accent.unwrap_or("#C6F46B"), depth, ascii);
+    crate::ui::ansi::set_plain(!std::io::stdout().is_terminal());
 }
 
 fn print_help() {
@@ -338,7 +361,7 @@ fn print_help() {
         .and_then(|db| crate::providers::resolve_provider_model(db, None, None).ok())
         .map(|(p, m)| (m, p.name))
         .unwrap_or_else(|| ("none yet".into(), "none yet".into()));
-    let config = crate::ui::text::home_relative(&dirs::config_dir().unwrap_or_default().join("aihat/config.toml"));
+    let config = crate::ui::text::home_relative(&dirs::config_dir().unwrap_or_default().join("aihat/settings.json"));
     let mut out = String::new();
     let mut line = |s: String| {
         out.push_str(&s);
@@ -355,9 +378,9 @@ fn print_help() {
     let commands = [
         ("providers", "list, add, test, set-default, set-key, remove endpoints", ""),
         ("models", "list models · set the default model", ""),
-        ("prompts", "list, show, use and add system prompts", ""),
+        ("prompts", "list, show and add system prompts", ""),
         ("chats", "list, show, continue, export past chats", ""),
-        ("mcp", "list, add, remove MCP servers", ""),
+        ("mcp", "list, add, remove, sign in to MCP servers", ""),
         ("skills", "list, enable, disable skills", ""),
         ("config", "get and set options ", &*format!("({config})")),
         ("backup", "export or restore everything ", "(same data as the phone app)"),
@@ -393,19 +416,30 @@ fn print_help() {
 
 fn print_command_help(argv: &[String]) {
     use clap::CommandFactory;
-    let mut command = Cli::command();
+    let command = Cli::command();
     let names: Vec<&str> = argv
         .iter()
         .skip(1)
         .filter(|arg| !arg.starts_with('-'))
         .map(String::as_str)
         .collect();
-    let mut current = &mut command;
+    let mut path: Vec<String> = Vec::new();
+    let mut current = &command;
     for name in names {
-        match current.find_subcommand_mut(name) {
-            Some(sub) => current = sub,
+        match current.find_subcommand(name) {
+            Some(sub) => {
+                path.push(sub.get_name().to_string());
+                current = sub;
+            }
             None => break,
         }
     }
-    let _ = current.print_long_help();
+    let mut target = command.clone();
+    for name in &path {
+        target = match target.find_subcommand(name) {
+            Some(sub) => sub.clone().bin_name(format!("aihat {}", path.join(" "))),
+            None => break,
+        };
+    }
+    let _ = target.print_long_help();
 }

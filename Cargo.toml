@@ -18,11 +18,14 @@ crossterm = "0.29"
 dirs = "6"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
-reqwest = { version = "0.13.5", features = ["blocking", "json"] }
+# rustls with the ring crypto library: builds with only a C compiler on every
+# release target (Windows, macOS, Linux on all CPUs and musl, the BSDs).
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls-no-provider", "charset", "http2", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rpassword = "7.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -37,5 +40,12 @@ supports-color = "3"
 strsim = "0.11"
 ctrlc = "3"
 ignore = "0.4"
-arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control", "image-data"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+sha2 = "0.10"
+webbrowser = "1"
 
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

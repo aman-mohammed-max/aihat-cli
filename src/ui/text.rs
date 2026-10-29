@@ -1,6 +1,5 @@
 //! Width-aware text helpers shared by the TUI and the command line output.
 
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -35,6 +34,28 @@ pub fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Cut from the start: `…/projects/fabric-mod`.
+pub fn truncate_left(text: &str, max: usize) -> String {
+    if width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 1;
+    for grapheme in text.graphemes(true).rev() {
+        let w = width(grapheme);
+        if used + w > max {
+            break;
+        }
+        kept.push(grapheme);
+        used += w;
+    }
+    kept.reverse();
+    format!("…{}", kept.concat())
+}
+
 /// Truncate, then pad with spaces to exactly `cols` columns.
 pub fn pad(text: &str, cols: usize) -> String {
     let mut out = truncate(text, cols);
@@ -53,7 +74,9 @@ pub fn pad_left(text: &str, cols: usize) -> String {
 pub fn clip_line(line: Line<'static>, max: usize) -> Line<'static> {
     let mut used = 0;
     let mut spans = Vec::new();
+    let line_style = line.style;
     for span in line.spans {
+        let span = Span::styled(span.content, line_style.patch(span.style));
         let w = width(&span.content);
         if used + w <= max {
             used += w;
@@ -92,10 +115,6 @@ pub fn spread(
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(right);
     clip_line(Line::from(spans), cols)
-}
-
-pub fn styled(text: impl Into<String>, style: Style) -> Span<'static> {
-    Span::styled(text.into(), style)
 }
 
 /// "2 min ago", "1 hour ago", "yesterday", "3 days ago", "2 weeks ago", "last month".
@@ -164,15 +183,14 @@ pub fn seconds(ms: u64) -> String {
 
 /// The path with the home folder written as `~`.
 pub fn home_relative(path: &std::path::Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rest) = path.strip_prefix(&home) {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rest) = path.strip_prefix(&home) {
             return if rest.as_os_str().is_empty() {
                 "~".into()
             } else {
                 format!("~/{}", rest.display())
             };
         }
-    }
     path.display().to_string()
 }
 
@@ -180,13 +198,6 @@ pub fn current_dir_label() -> String {
     std::env::current_dir()
         .map(|path| home_relative(&path))
         .unwrap_or_else(|_| ".".into())
-}
-
-pub fn current_dir_name() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "~".into())
 }
 
 /// The host of a URL without `www.`.

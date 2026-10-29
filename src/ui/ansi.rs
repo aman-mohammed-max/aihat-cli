@@ -3,13 +3,21 @@
 
 use super::theme::{Depth, theme};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static PLAIN: AtomicBool = AtomicBool::new(false);
+
+/// No escape codes at all: for output that goes to a pipe or a file.
+pub fn set_plain(plain: bool) {
+    PLAIN.store(plain, Ordering::Relaxed);
+}
 
 pub fn line(line: &Line<'_>) -> String {
     let mut out = String::new();
     for span in &line.spans {
-        out.push_str(&span_text(span));
+        out.push_str(&paint(&span.content, line.style.patch(span.style)));
     }
     out
 }
@@ -23,12 +31,8 @@ pub fn lines(lines: &[Line<'_>]) -> String {
     out
 }
 
-pub fn span_text(span: &Span<'_>) -> String {
-    paint(&span.content, span.style)
-}
-
 pub fn paint(text: &str, style: Style) -> String {
-    if theme().depth == Depth::None && style.add_modifier.is_empty() || text.is_empty() {
+    if PLAIN.load(Ordering::Relaxed) || theme().depth == Depth::None && style.add_modifier.is_empty() || text.is_empty() {
         return text.to_string();
     }
     let codes = sgr(style);

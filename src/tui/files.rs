@@ -109,8 +109,8 @@ fn describe_size(path: &Path) -> String {
         return String::new();
     };
     let bytes = meta.len();
-    if bytes <= 5_000_000 {
-        if let Ok(data) = std::fs::read(path) {
+    if bytes <= 5_000_000
+        && let Ok(data) = std::fs::read(path) {
             let head = &data[..data.len().min(8192)];
             if !head.contains(&0) && std::str::from_utf8(head).is_ok() {
                 let lines = data.iter().filter(|byte| **byte == b'\n').count()
@@ -118,7 +118,6 @@ fn describe_size(path: &Path) -> String {
                 return text::plural(lines, "line", "lines");
             }
         }
-    }
     match bytes {
         0..1_000 => format!("{bytes} B"),
         1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1000.0),
@@ -128,10 +127,9 @@ fn describe_size(path: &Path) -> String {
 
 /// `~/notes.md` → the home folder path.
 pub fn expand(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
-    }
     PathBuf::from(path)
 }

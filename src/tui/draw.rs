@@ -1,12 +1,12 @@
 //! Cell-exact drawing helpers. The design is a character grid, so screens are
 //! drawn by placing text at exact cells rather than through layout widgets.
 
-use crate::ui::text::{clip_line, line_width, width};
+use crate::ui::text::{clip_line, width};
 use crate::ui::theme::{Depth, Role, theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
 /// Write `text` at (x, y), never past `right` (exclusive). Returns the next x.
 pub fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, right: u16) -> u16 {
@@ -23,15 +23,7 @@ pub fn put_line(buf: &mut Buffer, x: u16, y: u16, line: &Line<'_>, right: u16) -
         if cursor >= right {
             break;
         }
-        cursor = put(buf, cursor, y, &span.content, span.style, right);
-    }
-    cursor
-}
-
-pub fn put_spans(buf: &mut Buffer, x: u16, y: u16, spans: &[Span<'_>], right: u16) -> u16 {
-    let mut cursor = x;
-    for span in spans {
-        cursor = put(buf, cursor, y, &span.content, span.style, right);
+        cursor = put(buf, cursor, y, &span.content, line.style.patch(span.style), right);
     }
     cursor
 }
@@ -133,34 +125,34 @@ pub fn rule(buf: &mut Buffer, x: u16, y: u16, cols: u16, style: Style) {
 }
 
 /// A list row inside a box: the selected row gets the highlight background
-/// across the whole inner width.
+/// under its text, up to the last word, as in the design's lists.
 pub fn row(buf: &mut Buffer, inner: Rect, y: u16, line: Line<'static>, selected: bool) {
     let line = clip_line(line, inner.width as usize);
     if selected {
         let bg = theme().selected(Role::Text);
-        let row = Rect::new(inner.x, y, inner.width, 1);
-        fill(buf, row, theme().base());
+        let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        let used = width(text.trim_end()) as u16;
+        fill(buf, Rect::new(inner.x, y, inner.width, 1), theme().base());
+        let row = Rect::new(inner.x, y, used.min(inner.width), 1);
         restyle(buf, row, Style { fg: None, ..bg });
         let mut cursor = inner.x;
+        let end = inner.x + used;
         for span in &line.spans {
             let style = span.style.patch(Style {
                 bg: bg.bg,
                 add_modifier: bg.add_modifier,
                 ..Style::default()
             });
-            cursor = put(buf, cursor, y, &span.content, style, inner.right());
+            let next = put(buf, cursor, y, &span.content, style, inner.right());
+            if next > end {
+                // Trailing spaces stay on the plain background.
+                restyle(buf, Rect::new(end.max(cursor), y, next - end.max(cursor), 1), Style { bg: theme().base().bg, ..Style::default() });
+            }
+            cursor = next;
         }
     } else {
         put_line(buf, inner.x, y, &line, inner.right());
     }
-}
-
-/// Left and right parts on one row, right part flush to the edge.
-pub fn spread(buf: &mut Buffer, area: Rect, y: u16, left: &Line<'_>, right: &Line<'_>) {
-    let right_width = line_width(right) as u16;
-    let right_x = area.right().saturating_sub(right_width);
-    put_line(buf, area.x, y, left, right_x.saturating_sub(1).max(area.x));
-    put_line(buf, right_x.max(area.x), y, right, area.right());
 }
 
 /// Centre a box horizontally; under 100 columns dialogs go full width.

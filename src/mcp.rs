@@ -13,8 +13,76 @@ pub struct DiscoveredTool {
     pub definition: Value,
 }
 
+/// Why a server can't be used until someone signs in.
+#[derive(Debug)]
+pub struct NeedsSignIn {
+    pub server: String,
+    /// A browser sign-in (rather than a pasted token) would fix it.
+    pub browser: bool,
+}
+
+impl std::fmt::Display for NeedsSignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.browser {
+            write!(f, "{} needs you to sign in (aihat mcp login {}, or s in /mcp)", self.server, self.server)
+        } else {
+            write!(f, "{} needs an access token (aihat mcp set-key {}, or k in /mcp)", self.server, self.server)
+        }
+    }
+}
+
+impl std::error::Error for NeedsSignIn {}
+
+pub fn needs_sign_in(error: &anyhow::Error) -> Option<&NeedsSignIn> {
+    error.chain().find_map(|cause| cause.downcast_ref::<NeedsSignIn>())
+}
+
+fn rejected(error: &anyhow::Error) -> bool {
+    api::api_error(error).is_some_and(|e| e.kind == api::ErrorKind::Auth)
+}
+
+/// One request to a server, whatever it runs on. Signed-in servers get a
+/// fresh token when theirs has run out, and one more try when the server
+/// turns the token down.
+fn rpc(server: &McpServer, secrets: &Secrets, method: &str, params: Value, id: u64) -> Result<Value> {
+    if server.transport == "stdio" {
+        return crate::mcp_stdio::request(server, method, params);
+    }
+    if server.auth != "oauth" {
+        let token = secrets.mcp_token(&server.id);
+        return api::mcp_rpc(server, token.as_deref(), method, params, id).map_err(|error| {
+            if rejected(&error) {
+                anyhow::Error::new(NeedsSignIn { server: server.name.clone(), browser: false })
+            } else {
+                error
+            }
+        });
+    }
+    let signed_out = || anyhow::Error::new(NeedsSignIn { server: server.name.clone(), browser: true });
+    let token = crate::oauth::access_token(secrets, &server.id, false).ok_or_else(signed_out)?;
+    match api::mcp_rpc(server, Some(&token), method, params.clone(), id) {
+        Err(error) if rejected(&error) => {
+            let fresh = crate::oauth::access_token(secrets, &server.id, true).ok_or_else(signed_out)?;
+            api::mcp_rpc(server, Some(&fresh), method, params, id).map_err(|error| if rejected(&error) { signed_out() } else { error })
+        }
+        other => other,
+    }
+}
+
+fn notify(server: &McpServer, secrets: &Secrets, method: &str, params: Value) -> Result<()> {
+    if server.transport == "stdio" {
+        return crate::mcp_stdio::notify(server, method, params);
+    }
+    let token = if server.auth == "oauth" {
+        crate::oauth::access_token(secrets, &server.id, false)
+    } else {
+        secrets.mcp_token(&server.id)
+    };
+    api::mcp_notify(server, token.as_deref(), method, params)
+}
+
 pub fn connect(server: &McpServer, secrets: &Secrets) -> Result<Vec<McpTool>> {
-    api::mcp_rpc(
+    rpc(
         server,
         secrets,
         "initialize",
@@ -25,7 +93,7 @@ pub fn connect(server: &McpServer, secrets: &Secrets) -> Result<Vec<McpTool>> {
         }),
         1,
     )?;
-    let _ = api::mcp_notify(server, secrets, "notifications/initialized", json!({}));
+    let _ = notify(server, secrets, "notifications/initialized", json!({}));
     let mut found = Vec::new();
     let mut cursor: Option<String> = None;
     for page in 0..10u64 {
@@ -33,7 +101,7 @@ pub fn connect(server: &McpServer, secrets: &Secrets) -> Result<Vec<McpTool>> {
             .as_ref()
             .map(|c| json!({"cursor": c}))
             .unwrap_or_else(|| json!({}));
-        let result = api::mcp_rpc(server, secrets, "tools/list", params, 2 + page)?;
+        let result = rpc(server, secrets, "tools/list", params, 2 + page)?;
         if let Some(tools) = result.get("tools").and_then(Value::as_array) {
             for raw in tools {
                 let Some(name) = raw.get("name").and_then(Value::as_str) else {
@@ -69,6 +137,56 @@ pub fn connect(server: &McpServer, secrets: &Secrets) -> Result<Vec<McpTool>> {
     Ok(found)
 }
 
+/// Connect a server and load its tools, signing in first when it needs a
+/// browser sign-in. `on_opened` hears the sign-in address once the browser
+/// was asked to open it; `cancel` stops the wait for the browser.
+pub fn connect_server(
+    db: &Database,
+    secrets: &Secrets,
+    id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_opened: &mut dyn FnMut(&str),
+) -> Result<usize> {
+    let server = db
+        .mcp_servers()?
+        .into_iter()
+        .find(|s| s.id == id)
+        .with_context(|| format!("no MCP server {id}"))?;
+    let mut step = |step: crate::oauth::Step<'_>| match step {
+        crate::oauth::Step::Opened(url) => on_opened(url),
+    };
+    if server.transport == "stdio" {
+        return refresh(db, secrets, id);
+    }
+    if server.auth == "oauth" {
+        if !crate::oauth::is_signed_in(secrets, id) {
+            crate::oauth::sign_in(secrets, id, &server.url, cancel, &mut step)?;
+        }
+        return refresh(db, secrets, id);
+    }
+    match refresh(db, secrets, id) {
+        // No token yet and the server turns us away: if it offers a browser
+        // sign-in, use that.
+        Err(error)
+            if needs_sign_in(&error).is_some()
+                && secrets.mcp_token(id).is_none()
+                && crate::oauth::probe(&server.url) == crate::oauth::Need::SignIn =>
+        {
+            db.set_mcp_auth(id, "oauth")?;
+            crate::oauth::sign_in(secrets, id, &server.url, cancel, &mut step)?;
+            refresh(db, secrets, id)
+        }
+        other => other,
+    }
+}
+
+/// Forget a server's sign-in and stop its program.
+pub fn forget(secrets: &Secrets, id: &str) {
+    let _ = secrets.delete(&format!("mcp.{id}"));
+    crate::oauth::forget(secrets, id);
+    crate::mcp_stdio::stop(Some(id));
+}
+
 pub fn refresh(db: &Database, secrets: &Secrets, id_or_name: &str) -> Result<usize> {
     let server = db
         .mcp_servers()?
@@ -86,10 +204,80 @@ pub fn refresh(db: &Database, secrets: &Secrets, id_or_name: &str) -> Result<usi
     Ok(tools.len())
 }
 
+/// Connect, and when the server turns us away but offers a browser sign-in,
+/// sign in (telling `on_sign_in` the server and address) and try again.
+fn connect_signing_in(
+    db: &Database,
+    secrets: &Secrets,
+    server: &mut McpServer,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_sign_in: &mut dyn FnMut(&str, &str),
+) -> Result<Vec<McpTool>> {
+    match connect(server, secrets) {
+        Err(error) if can_sign_in(server, secrets, &error) => {
+            sign_in_now(db, secrets, server, cancel, on_sign_in)?;
+            connect(server, secrets)
+        }
+        other => other,
+    }
+}
+
+/// The error means "sign in", and a browser sign-in is how this server
+/// does it (asked once, when nothing else was set up).
+fn can_sign_in(server: &McpServer, secrets: &Secrets, error: &anyhow::Error) -> bool {
+    match needs_sign_in(error) {
+        Some(need) if need.browser => true,
+        Some(_) => secrets.mcp_token(&server.id).is_none() && crate::oauth::probe(&server.url) == crate::oauth::Need::SignIn,
+        None => false,
+    }
+}
+
+fn sign_in_now(
+    db: &Database,
+    secrets: &Secrets,
+    server: &mut McpServer,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_sign_in: &mut dyn FnMut(&str, &str),
+) -> Result<()> {
+    if server.auth != "oauth" {
+        db.set_mcp_auth(&server.id, "oauth")?;
+        server.auth = "oauth".into();
+    }
+    let name = server.name.clone();
+    crate::oauth::sign_in(secrets, &server.id, &server.url, cancel, &mut |step| match step {
+        crate::oauth::Step::Opened(url) => on_sign_in(&name, url),
+    })
+}
+
+/// Run a tool; if the sign-in ran out on the way, sign in again and run it once more.
+pub fn call_signing_in(
+    db: &Database,
+    secrets: &Secrets,
+    server: &McpServer,
+    name: &str,
+    args: Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_sign_in: &mut dyn FnMut(&str, &str),
+) -> Result<String> {
+    match call(server, secrets, name, args.clone()) {
+        Err(error) if can_sign_in(server, secrets, &error) => {
+            let mut server = server.clone();
+            sign_in_now(db, secrets, &mut server, cancel, on_sign_in)?;
+            call(&server, secrets, name, args)
+        }
+        other => other,
+    }
+}
+
+/// The tools of the servers a chat uses. Servers that need a browser
+/// sign-in get one on the spot (`on_sign_in` hears about it; `cancel`
+/// stops the wait).
 pub fn discover(
     db: &Database,
     secrets: &Secrets,
     enabled_ids: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+    on_sign_in: &mut dyn FnMut(&str, &str),
 ) -> (Vec<DiscoveredTool>, Vec<String>) {
     let servers = match db.mcp_servers() {
         Ok(servers) => servers,
@@ -106,8 +294,9 @@ pub fn discover(
         .into_iter()
         .filter(|s| enabled_ids.iter().any(|id| id == &s.id))
     {
-        if server.tools.is_empty() || !server.connected {
-            match connect(&server, secrets) {
+        let signed_out = server.auth == "oauth" && !crate::oauth::is_signed_in(secrets, &server.id);
+        if server.tools.is_empty() || !server.connected || signed_out {
+            match connect_signing_in(db, secrets, &mut server, cancel, on_sign_in) {
                 Ok(tools) => {
                     server.tools = tools;
                     if let Err(error) = db.update_mcp_tools(
@@ -170,7 +359,7 @@ pub fn find_tool<'a>(tools: &'a [DiscoveredTool], name: &str) -> Option<&'a Disc
 }
 
 pub fn call(server: &McpServer, secrets: &Secrets, name: &str, args: Value) -> Result<String> {
-    let result = api::mcp_rpc(
+    let result = rpc(
         server,
         secrets,
         "tools/call",
@@ -289,7 +478,7 @@ fn classify_tool(name: &str, annotations: Option<&Value>) -> &'static str {
     {
         return "read";
     }
-    let words = name.replace('_', " ").replace('-', " ").to_lowercase();
+    let words = name.replace(['_', '-'], " ").to_lowercase();
     if annotations
         .and_then(|a| a.get("destructiveHint"))
         .and_then(Value::as_bool)
@@ -378,13 +567,13 @@ mod tests {
         let paths = Paths {
             data_dir: dir.clone(),
             db_file: dir.join("aihat.db"),
-            config_file: dir.join("config.toml"),
+            config_file: dir.join("settings.json"),
             keys_file: dir.join("keys.json"),
             downloads_dir: dir.join("Downloads"),
         };
         let db = Database::open(&paths.db_file).unwrap();
         let server_id = db
-            .add_mcp_server("Notes", "https://example.test/mcp")
+            .add_mcp_server("Notes", "https://example.test/mcp", "http", "none")
             .unwrap();
         let tools = vec![tool("create_note", "write", "ask")];
         db.update_mcp_tools(&server_id, &serde_json::to_value(&tools).unwrap())
@@ -392,7 +581,7 @@ mod tests {
         db.set_kv(&format!("mcp_always_allow_{server_id}"), "true")
             .unwrap();
 
-        let (discovered, warnings) = discover(&db, &Secrets::new(&paths), &[server_id]);
+        let (discovered, warnings) = discover(&db, &Secrets::new(&paths), &[server_id], &std::sync::atomic::AtomicBool::new(false), &mut |_, _| {});
         assert!(warnings.is_empty());
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].tool.policy, "allow");
@@ -404,7 +593,7 @@ mod tests {
             .find(|server| server.id == discovered[0].server.id)
             .unwrap();
         set_server_always_allowed(&db, &mut server, false).unwrap();
-        let (discovered, warnings) = discover(&db, &Secrets::new(&paths), &[server.id.clone()]);
+        let (discovered, warnings) = discover(&db, &Secrets::new(&paths), &[server.id.clone()], &std::sync::atomic::AtomicBool::new(false), &mut |_, _| {});
         assert!(warnings.is_empty());
         assert_eq!(discovered[0].tool.policy, "ask");
         assert!(call_requires_approval(&discovered[0].tool));
