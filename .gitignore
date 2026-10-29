@@ -2,3 +2,4 @@
 .env
 *.log
 
+cargo-build.log
