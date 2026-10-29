@@ -1,10 +1,9 @@
 //! Speaking instead of typing: record from the microphone with a recorder
 //! the computer already has (PipeWire, PulseAudio, ALSA, SoX or ffmpeg),
 //! then turn the speech into text, either on this computer with Phonon-2
-//! (`pip install fermion-research` gives the `phonon` command; it runs on the
-//! CPU, no network needed) or with any OpenAI-compatible
-//! `/audio/transcriptions` endpoint: `phonon serve`, your provider, or one in
-//! settings.json.
+//! (downloaded from Hugging Face and run by aihat's own Rust engine, see
+//! stt.rs; no network once downloaded) or with any OpenAI-compatible
+//! `/audio/transcriptions` endpoint: your provider, or one in settings.json.
 
 use crate::config::VoiceConfig;
 use crate::db::Database;
@@ -123,21 +122,40 @@ impl Recording {
     }
 }
 
-/// Which way speech becomes text: "phonon" (offline), "endpoint", or "auto"
-/// (phonon when it is installed, else the endpoint).
+/// The Phonon-2 files on Hugging Face, and their published checksums.
+const MODEL_URL: &str = "https://huggingface.co/FermionResearch/Phonon-2/resolve/main/phonon-2.bps.tar.zst";
+const MODEL_SHA256: &str = "98125795b6dda72f5c6eee9ba33d19815df65dcb18b50a357bf9f73c9935309e";
+const CONTAINER_SHA256: &str = "4b6bfa3a12cc3c4e0a54f2ab3ec4ca7a842b09e5c7ecfc8e7ca0ac6cc8c11468";
+pub const MODEL_BYTES: u64 = 163_515_201;
+/// The tokenizer is the base model's (parakeet-tdt-0.6b-v3).
+const TOKENIZER_URL: &str = "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
+
+/// Where the downloaded model lives.
+pub fn model_dir() -> PathBuf {
+    let data = crate::config::Paths::resolve(None).map(|p| p.data_dir).unwrap_or_else(|_| std::env::temp_dir());
+    data.join("models").join("phonon-2")
+}
+
+pub fn model_installed() -> bool {
+    let dir = model_dir();
+    dir.join("model.fermion").is_file() && dir.join("tokenizer.json").is_file()
+}
+
+/// Which way speech becomes text: "local" (Phonon-2 on this computer),
+/// "endpoint", or "auto": local once the model is downloaded.
 pub fn engine(config: &VoiceConfig) -> &'static str {
     match config.engine.as_str() {
-        "phonon" | "offline" | "local" => "phonon",
+        "local" | "phonon" | "offline" => "local",
         "endpoint" | "online" | "api" => "endpoint",
-        _ if on_path("phonon") => "phonon",
+        _ if model_installed() => "local",
         _ => "endpoint",
     }
 }
 
-/// Turn a recording (or any audio file) into text.
+/// Turn a recording (or any WAV or FLAC file) into text.
 pub fn transcribe(config: &VoiceConfig, db: &Database, secrets: &Secrets, file: &Path) -> Result<String> {
     let text = match engine(config) {
-        "phonon" => transcribe_offline(file)?,
+        "local" => transcribe_local(file)?,
         _ => transcribe_online(config, db, secrets, file)?,
     };
     let text = text.trim().to_string();
@@ -147,17 +165,49 @@ pub fn transcribe(config: &VoiceConfig, db: &Database, secrets: &Secrets, file: 
     Ok(text)
 }
 
-/// Phonon-2 on this computer: `phonon transcribe FILE`.
-fn transcribe_offline(file: &Path) -> Result<String> {
-    if !on_path("phonon") {
-        bail!("Offline speech needs Phonon-2: pip install fermion-research (then `phonon` is on your PATH).");
+/// The model stays loaded after the first use, so later recordings start at once.
+static LOADED: std::sync::Mutex<Option<std::sync::Arc<crate::stt::Phonon>>> = std::sync::Mutex::new(None);
+
+fn transcribe_local(file: &Path) -> Result<String> {
+    if !model_installed() {
+        bail!("Phonon-2 isn't downloaded yet: /voice in the chat, or aihat voice download.");
     }
-    let output = Command::new("phonon").arg("transcribe").arg(file).stdin(Stdio::null()).output().context("couldn't run phonon")?;
-    if !output.status.success() {
-        let why = String::from_utf8_lossy(&output.stderr);
-        bail!("phonon couldn't transcribe it: {}", why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error"));
+    let audio = crate::stt::read_audio(file)?;
+    let model = {
+        let mut slot = LOADED.lock().map_err(|_| anyhow!("the speech model is busy"))?;
+        match slot.as_ref() {
+            Some(model) => model.clone(),
+            None => {
+                let model = std::sync::Arc::new(crate::stt::Phonon::load(&model_dir()).context("loading Phonon-2")?);
+                *slot = Some(model.clone());
+                model
+            }
+        }
+    };
+    model.transcribe(&audio)
+}
+
+/// Load the model in the background (while the person is still talking),
+/// so the text comes sooner.
+pub fn preload() {
+    if !model_installed() || LOADED.lock().map(|slot| slot.is_some()).unwrap_or(true) {
+        return;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    std::thread::spawn(|| {
+        if let Ok(model) = crate::stt::Phonon::load(&model_dir())
+            && let Ok(mut slot) = LOADED.lock()
+            && slot.is_none()
+        {
+            *slot = Some(std::sync::Arc::new(model));
+        }
+    });
+}
+
+/// Free the loaded model (after deleting it, or to give memory back).
+pub fn unload() {
+    if let Ok(mut slot) = LOADED.lock() {
+        *slot = None;
+    }
 }
 
 /// An OpenAI-compatible endpoint: voice.url (like `phonon serve` at
@@ -166,10 +216,105 @@ fn transcribe_online(config: &VoiceConfig, db: &Database, secrets: &Secrets, fil
     let audio = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let model = if config.model.trim().is_empty() { "whisper-1".to_string() } else { config.model.trim().to_string() };
     if config.url.trim().is_empty() {
-        let provider = db.default_provider()?.context("Add a provider first, or set voice.url to a speech endpoint (phonon serve gives one).")?;
+        let provider = db.default_provider()?.context("Add a provider first, or set voice.url to a speech endpoint.")?;
         return crate::api::transcribe(&provider.base_url, Some((&provider, secrets)), &model, audio);
     }
     crate::api::transcribe(config.url.trim(), None, &model, audio)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path)?;
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Download Phonon-2 from Hugging Face (164 MB) and unpack it, all in Rust.
+/// `progress` gets (bytes so far, total). `cancel` stops it.
+pub fn download(progress: &mut dyn FnMut(u64, u64), cancel: &std::sync::atomic::AtomicBool) -> Result<PathBuf> {
+    use std::io::{Read, Write};
+    let dir = model_dir();
+    std::fs::create_dir_all(&dir)?;
+    let archive = dir.join("phonon-2.bps.tar.zst.part");
+    let client = crate::api::client(3_600_000)?;
+    let mut response = client.get(MODEL_URL).send().context("Couldn't reach Hugging Face")?;
+    if !response.status().is_success() {
+        bail!("Hugging Face answered {} for the model", response.status());
+    }
+    let total = response.content_length().unwrap_or(MODEL_BYTES);
+    let mut out = std::fs::File::create(&archive)?;
+    let mut done = 0u64;
+    let mut chunk = vec![0u8; 256 * 1024];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            drop(out);
+            let _ = std::fs::remove_file(&archive);
+            bail!("Download stopped");
+        }
+        let read = response.read(&mut chunk).context("the download broke off")?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&chunk[..read])?;
+        done += read as u64;
+        progress(done, total);
+    }
+    out.flush()?;
+    drop(out);
+    if sha256_file(&archive)? != MODEL_SHA256 {
+        let _ = std::fs::remove_file(&archive);
+        bail!("The download doesn't match Phonon-2's published checksum, so it was not used.");
+    }
+    // .tar.zst: unpack model.fermion only.
+    let decoder = ruzstd::decoding::StreamingDecoder::new(std::fs::File::open(&archive)?).map_err(|e| anyhow!("unpacking: {e}"))?;
+    let target = dir.join("model.fermion");
+    untar_one(decoder, "model.fermion", &target)?;
+    let _ = std::fs::remove_file(&archive);
+    if sha256_file(&target)? != CONTAINER_SHA256 {
+        let _ = std::fs::remove_file(&target);
+        bail!("The unpacked model doesn't match its checksum.");
+    }
+    let tokenizer = client.get(TOKENIZER_URL).send().context("Couldn't reach Hugging Face for the tokenizer")?;
+    if !tokenizer.status().is_success() {
+        bail!("Hugging Face answered {} for the tokenizer", tokenizer.status());
+    }
+    std::fs::write(dir.join("tokenizer.json"), tokenizer.bytes()?)?;
+    Ok(dir)
+}
+
+/// Copy the file named `name` (in any folder) out of a tar stream.
+fn untar_one(mut tar: impl std::io::Read, name: &str, target: &Path) -> Result<()> {
+    let mut header = [0u8; 512];
+    loop {
+        if tar.read_exact(&mut header).is_err() || header.iter().all(|&b| b == 0) {
+            bail!("{name} isn't in the download");
+        }
+        let text = |range: std::ops::Range<usize>| {
+            let raw = &header[range];
+            String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned()
+        };
+        let size = u64::from_str_radix(text(124..136).trim(), 8).unwrap_or(0);
+        let path = text(0..100);
+        let padded = size.div_ceil(512) * 512;
+        if path.rsplit('/').next() == Some(name) && matches!(header[156], b'0' | 0) {
+            let mut out = std::fs::File::create(target)?;
+            std::io::copy(&mut std::io::Read::take(&mut tar, size), &mut out)?;
+            std::io::copy(&mut std::io::Read::take(&mut tar, padded - size), &mut std::io::sink())?;
+            return Ok(());
+        }
+        std::io::copy(&mut std::io::Read::take(&mut tar, padded), &mut std::io::sink())?;
+    }
+}
+
+/// Remove the downloaded model.
+pub fn remove_model() -> Result<()> {
+    unload();
+    let dir = model_dir();
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -180,7 +325,7 @@ mod tests {
     fn engines_are_named_plainly() {
         let mut config = VoiceConfig::default();
         config.engine = "offline".into();
-        assert_eq!(engine(&config), "phonon");
+        assert_eq!(engine(&config), "local");
         config.engine = "online".into();
         assert_eq!(engine(&config), "endpoint");
     }

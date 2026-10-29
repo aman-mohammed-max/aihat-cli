@@ -132,10 +132,12 @@ From the shell, `aihat --folder "why do the tests fail?"` lets it read the folde
 
 Recording uses what the computer has: PipeWire (`pw-record`), PulseAudio (`parecord`), ALSA (`arecord`), SoX or ffmpeg; `voice.record` in settings.json can name another command that records to `{file}`. On a Chromebook, turn on Settings › Linux › Allow Linux to access your microphone.
 
-Speech becomes text one of two ways (`voice.engine`):
+Speech becomes text one of two ways, chosen in `/voice` (or `aihat voice use local|endpoint|auto`):
 
-- **Offline, with Phonon-2**, an English speech model of 164 MB that runs on the CPU: `pip install fermion-research` puts the `phonon` command on your PATH, and aihat uses it when it's there (`auto`, the default) or always (`phonon`).
-- **Online**, through any OpenAI-compatible `/audio/transcriptions` endpoint (`endpoint`): your default provider, or `voice.url`, for example `phonon serve --port 8010` gives `http://127.0.0.1:8010/v1`. `voice.model` names the model (default `whisper-1`).
+- **On this computer, with Phonon-2**, an English speech model (Fermion Research, from NVIDIA's Parakeet TDT 0.6B v3, CC-BY-4.0). `/voice` downloads it from Hugging Face (164 MB, checked against its published checksums), or `aihat voice download`. AI Hat runs it itself, in Rust: no Python, nothing else to install, and no network once it is downloaded. It needs about 250 MB of memory while in use and loads while you are still speaking. `aihat voice remove` deletes it.
+- **An endpoint**: any OpenAI-compatible `/audio/transcriptions` (your default provider, or an address and model set in `/voice`).
+
+`auto` (the default) uses Phonon-2 once it is downloaded, else the endpoint. `aihat transcribe recording.wav` (WAV or FLAC) prints what a file says.
 
 ```json
 "voice": { "engine": "auto", "url": "", "model": "", "record": "" }

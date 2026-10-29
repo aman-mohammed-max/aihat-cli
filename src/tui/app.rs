@@ -100,6 +100,14 @@ pub enum Task {
     SkillInstalledGlobally {
         result: Result<(String, std::path::PathBuf), String>,
     },
+    /// How far the Phonon-2 download has got.
+    VoiceProgress {
+        done: u64,
+        total: u64,
+    },
+    VoiceDownloaded {
+        result: Result<(), String>,
+    },
     /// Speech turned into text (or why not).
     Transcribed {
         result: Result<String, String>,
@@ -180,6 +188,8 @@ pub struct App {
     pub folder: Option<FolderAccess>,
     /// Listening to the microphone (ctrl+t).
     pub recording: Option<crate::voice::Recording>,
+    /// Phonon-2 being downloaded (from /voice).
+    pub voice_download: Option<super::voice::Download>,
     pub popup_selection: usize,
     pub popup_dismissed: Option<String>,
     pub turn: Option<ActiveTurn>,
@@ -250,6 +260,7 @@ impl App {
             dialog: None,
             folder: None,
             recording: None,
+            voice_download: None,
             popup_selection: 0,
             popup_dismissed: None,
             turn: None,
@@ -906,7 +917,8 @@ impl App {
             "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
             "about" | "version" => self.dialog = Some(Dialog::About(Default::default())),
-            "voice" | "talk" | "speak" => self.toggle_voice(),
+            "voice" | "speech" => self.dialog = Some(Dialog::Voice(Default::default())),
+            "talk" | "speak" => self.toggle_voice(),
             "folder" | "workspace" | "access" => super::folder::command(self, args),
             "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
@@ -1395,7 +1407,7 @@ impl App {
 
     fn on_task(&mut self, task: Task) {
         // Marketplace lookups run quietly beside other work.
-        if !matches!(task, Task::MarketResults { .. } | Task::MarketDetail { .. }) {
+        if !matches!(task, Task::MarketResults { .. } | Task::MarketDetail { .. } | Task::VoiceProgress { .. } | Task::VoiceDownloaded { .. }) {
             self.busy_task = None;
         }
         match task {
@@ -1497,6 +1509,19 @@ impl App {
                 self.sign_in_cancel = None;
                 self.dialog = Some(Dialog::Form(dialogs::Form::mcp_token(&id, &name)));
                 self.notify(Role::Warn, format!("{name} needs an access token"));
+            }
+            Task::VoiceProgress { done, total } => {
+                if let Some(download) = self.voice_download.as_mut() {
+                    download.done = done;
+                    download.total = total;
+                }
+            }
+            Task::VoiceDownloaded { result } => {
+                self.voice_download = None;
+                match result {
+                    Ok(()) => self.ok(format!("Phonon-2 is ready · {} talks, on this computer", keys::label(Action::Voice))),
+                    Err(error) => self.fail(error),
+                }
             }
             Task::Transcribed { result } => match result {
                 Ok(text) => {
@@ -1836,8 +1861,16 @@ impl App {
             });
             return;
         }
+        if crate::voice::engine(&self.config.voice) == "local" && !crate::voice::model_installed() {
+            self.dialog = Some(Dialog::Voice(Default::default()));
+            self.notify(Role::Warn, "Download Phonon-2 first (enter on Model), or choose the endpoint");
+            return;
+        }
         match crate::voice::start(&self.config.voice) {
             Ok(recording) => {
+                if crate::voice::engine(&self.config.voice) == "local" {
+                    crate::voice::preload();
+                }
                 self.recording = Some(recording);
                 self.notify(Role::Accent, format!("Listening… {} or enter stops · esc cancels", keys::label(Action::Voice)));
             }

@@ -29,6 +29,7 @@ pub enum Dialog {
     About(super::about::AboutDialog),
     Effort(EffortPicker),
     Folder(super::folder::FolderDialog),
+    Voice(super::voice::VoiceDialog),
 }
 
 // ------------------------------------------------------------------ shared
@@ -1439,6 +1440,8 @@ pub enum FormKind {
     MarketMcp(Box<crate::market::McpListing>),
     /// Describe an assistant; the model writes its system prompt.
     WritePrompt,
+    /// The speech endpoint's address and model.
+    VoiceEndpoint,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1655,6 +1658,21 @@ impl Form {
             title: format!("Add {}", server.title),
             kind: FormKind::MarketMcp(Box::new(server)),
             fields,
+            focus: 0,
+            status: None,
+            testable: false,
+            token: 0,
+        }
+    }
+
+    pub fn voice_endpoint(voice: &crate::config::VoiceConfig) -> Self {
+        Self {
+            title: "Speech endpoint".into(),
+            kind: FormKind::VoiceEndpoint,
+            fields: vec![
+                Field::text("Address", voice.url.clone(), "empty: your default provider · or http://…/v1"),
+                Field::text("Model", voice.model.clone(), "whisper-1"),
+            ],
             focus: 0,
             status: None,
             testable: false,
@@ -2047,6 +2065,18 @@ impl Form {
                 refresh_mcp(app, id, name);
                 Ok(true)
             }
+            FormKind::VoiceEndpoint => {
+                let address = self.field("Address");
+                if !address.is_empty() && !(address.starts_with("http://") || address.starts_with("https://")) {
+                    return Err("The address starts with http:// or https://".into());
+                }
+                app.config.voice.url = address.trim_end_matches('/').to_string();
+                app.config.voice.model = self.field("Model");
+                app.config.save(&app.paths).map_err(|e| e.to_string())?;
+                app.ok("Saved the speech endpoint");
+                app.dialog = Some(Dialog::Voice(Default::default()));
+                Ok(false)
+            }
             FormKind::WritePrompt => {
                 let description = self.field("Describe it");
                 if description.is_empty() {
@@ -2432,6 +2462,7 @@ pub fn draw(app: &App, buf: &mut Buffer, screen: Rect) {
         Some(Dialog::About(dialog)) => dialog.draw(buf, screen),
         Some(Dialog::Effort(picker)) => picker.draw(app, buf, screen),
         Some(Dialog::Folder(dialog)) => dialog.draw(app, buf, screen),
+        Some(Dialog::Voice(dialog)) => dialog.draw(app, buf, screen),
         None => {}
     }
 }
@@ -2458,6 +2489,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
         Dialog::About(dialog) => dialog.key(app, key),
         Dialog::Effort(picker) => picker.key(app, key),
         Dialog::Folder(dialog) => dialog.key(app, key),
+        Dialog::Voice(dialog) => dialog.key(app, key),
     };
     if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);

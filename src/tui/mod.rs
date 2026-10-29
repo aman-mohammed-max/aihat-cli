@@ -15,6 +15,7 @@ mod providers;
 mod tasks;
 mod transcript;
 mod view;
+mod voice;
 
 use crate::config::{AppConfig, Paths};
 use crate::db::Database;

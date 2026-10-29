@@ -51,7 +51,8 @@ pub const COMMANDS: &[Command] = &[
     command("settings", "open settings.json", None, false),
     // After the design's list: commands added since.
     command("folder", "let the assistant read this folder · run commands", None, false),
-    command("voice", "speak instead of typing", Some(Action::Voice), false),
+    command("talk", "speak instead of typing", Some(Action::Voice), false),
+    command("voice", "speech to text: Phonon-2 on this computer, or an endpoint", None, false),
     command("market", "find skills and MCP servers to add", None, false),
     command("effort", "how much the model thinks: off, low, medium, high", None, false),
     command("newprompt", "describe an assistant · the model writes its system prompt", None, true),

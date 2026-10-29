@@ -111,8 +111,13 @@ enum Top {
     SearchKey(Sub<commands::SearchKeyAction>),
     /// Who made AI Hat, and where to find it
     About,
-    /// Turn speech in an audio file into text
+    /// Turn speech in an audio file (WAV or FLAC) into text
     Transcribe { file: PathBuf },
+    /// Speech to text: download Phonon-2, choose local or endpoint
+    Voice {
+        #[command(subcommand)]
+        action: Option<VoiceAction>,
+    },
     /// Show a picture here, to see which way of drawing looks best
     Preview {
         file: PathBuf,
@@ -129,6 +134,16 @@ enum Top {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum VoiceAction {
+    /// Download Phonon-2 from Hugging Face (164 MB) to run on this computer
+    Download,
+    /// local (Phonon-2 here), endpoint (an OpenAI-compatible URL), or auto
+    Use { engine: String },
+    /// Delete the downloaded model
+    Remove,
 }
 
 #[derive(Args, Debug)]
@@ -314,6 +329,7 @@ fn run() -> Result<i32> {
             print_about();
             Ok(0)
         }
+        Some(Top::Voice { action }) => voice_command(&mut env, action),
         Some(Top::Transcribe { file }) => {
             let text = crate::voice::transcribe(&env.config.voice, &env.db, &env.secrets, &file).map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
             println!("{text}");
@@ -462,6 +478,60 @@ fn print_help() {
     line(String::new());
     line(format!("{} aihat <command> --help {}", dim("Run"), dim("for a command's own options.")));
     print!("{out}");
+}
+
+/// `aihat voice`: what turns speech into text, and the model download.
+fn voice_command(env: &mut Env, action: Option<VoiceAction>) -> Result<i32> {
+    let t = theme();
+    let ok = |text: String| println!("{} {text}", paint("✓", t.fg(Role::Accent)));
+    match action {
+        None => {
+            let installed = crate::voice::model_installed();
+            println!("{}  {}", paint("Speech to text", t.bold(Role::Strong)), paint(&format!("(voice.engine: {})", env.config.voice.engine), t.fg(Role::Dim)));
+            let using = crate::voice::engine(&env.config.voice);
+            println!("  Using     {}", if using == "local" { "Phonon-2 on this computer".to_string() } else if env.config.voice.url.is_empty() { "your default provider's /audio/transcriptions".to_string() } else { env.config.voice.url.clone() });
+            println!("  Phonon-2  {}", if installed { format!("downloaded · {}", crate::ui::text::home_relative(&crate::voice::model_dir())) } else { "not downloaded · aihat voice download".to_string() });
+            Ok(0)
+        }
+        Some(VoiceAction::Download) => {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut last = 0;
+            let dir = crate::voice::download(
+                &mut |done, total| {
+                    let pct = done * 100 / total.max(1);
+                    if pct != last {
+                        last = pct;
+                        eprint!("\r  Downloading Phonon-2 from Hugging Face… {pct}% ({} of {} MB)", done / 1_000_000, total / 1_000_000);
+                    }
+                },
+                &cancel,
+            )
+            .map_err(|e| Failure::new(EXIT_ERROR, format!("{e:#}")))?;
+            eprintln!();
+            ok(format!("Phonon-2 is ready · {} · speech now turns into text on this computer", crate::ui::text::home_relative(&dir)));
+            Ok(0)
+        }
+        Some(VoiceAction::Use { engine }) => {
+            let engine = match engine.as_str() {
+                "local" | "phonon" | "offline" => "local",
+                "endpoint" | "online" => "endpoint",
+                "auto" => "auto",
+                other => return Err(Failure::new(EXIT_USAGE, format!("{other}? Use local, endpoint or auto")).into()),
+            };
+            env.config.voice.engine = engine.into();
+            env.config.save(&env.paths)?;
+            ok(format!("Speech to text: {engine}"));
+            if engine == "local" && !crate::voice::model_installed() {
+                println!("  Download the model first: aihat voice download");
+            }
+            Ok(0)
+        }
+        Some(VoiceAction::Remove) => {
+            crate::voice::remove_model()?;
+            ok("Deleted Phonon-2".to_string());
+            Ok(0)
+        }
+    }
 }
 
 /// `aihat --voice`: record until enter, then turn it into text.

@@ -20,6 +20,7 @@ mod providers;
 mod search;
 mod secrets;
 mod skills;
+mod stt;
 mod tui;
 mod ui;
 mod voice;
