@@ -1,205 +1,213 @@
-# AI Hat CLI
+<div align="center">
 
-AI Hat in the terminal: chat with any OpenAI-compatible model. Running `aihat` opens the full-screen chat; `aihat "prompt"` and `aihat <command>` print and exit, so they work in scripts and pipes.
+# ◆ AI Hat
 
-It uses the same SQLite database, providers, models, system prompts, skills, MCP servers and chats as the AI Hat app, and follows the terminal screens in the AI Hat design.
+**Chat with any AI model, right in your terminal.**
 
-## Build
+Bring your own models — OpenRouter, Groq, Ollama, LM Studio, vLLM, or any OpenAI-compatible server — and chat in a fast, good-looking full-screen app. Same providers, prompts, skills and chats as the AI Hat phone and desktop app.
 
-Install a current Rust toolchain, then:
+[**Download**](#download) · [Get started](#get-started) · [What it can do](#what-it-can-do) · [Help](#help) · [Full guide](docs/GUIDE.md)
 
-    cargo build --release
-    cargo install --path .
+</div>
 
-The binary is named `aihat`.
+```text
+ ◆ AI Hat 0.1.0 · ~/projects/fabric-mod                                  qwen3-32b · Home vLLM
+──────────────────────────────────────────────────────────────────────────────────────────────
 
-## First run
+ › what changed in the Fabric API this month? check the web
 
-    aihat providers add      # guided: preset, name, URL, key, connection test, models
-    aihat "hello"            # one reply, printed
-    aihat                    # the full-screen chat
+ ● web_search "fabric api changes october 2026"
+   └ 8 results · read 6 pages · 1.8s
 
-For scripts, add an endpoint without questions:
+ ● Two releases landed this month.
 
-    aihat providers add "Home vLLM" --url http://192.168.1.40:8000/v1 \
-        --key-env VLLM_KEY --models qwen3-32b,qwen3-vl-32b --default
+   1. Networking now uses payload records. Register each payload once, then send it
+      from the server or the client. [1]
+   2. Two render hooks are deprecated in favour of the new render events. [2]
 
-Presets fill in the URL for OpenRouter, Groq, Ollama, LM Studio, vLLM and FreeLLMAPI. API keys go to the system keychain on macOS and Windows. On Linux they go to a private `keys.json` in AI Hat's data folder that only you can read: the Linux kernel keyring forgets everything at restart, so older builds lost keys that way. A key such a build left there is moved over the first time it's used. Keys are never written to SQLite or `settings.json`.
+   Sources  [1] fabricmc.net · Fabric 0.116 release notes   [2] github.com · changelog
+   412 tokens · 182 tok/s · 2.3s
+╭────────────────────────────────────────────────────────────────────────────────────────────╮
+│ › Ask anything · / commands · @ attach a file · ! run a shell command                      │
+╰────────────────────────────────────────────────────────────────────────────────────────────╯
+ enter send · shift+enter line · esc stop · ctrl+p model · ? keys          9.8k / 128k · 38 ms
+```
 
-## The full-screen chat
+## Download
 
-The screen is a header, the conversation, the message box and a status line. Replies are rendered as Markdown: headings, lists, tables, quotes, links, `[1]` citations, and code blocks with line numbers and syntax highlighting. Tool calls show as `● web_search "…"` with a `└` summary, reasoning as `◇ Thought`, and each reply ends with its sources and token stats.
+Pick your system. Every file is on the [Releases page](https://github.com/aman-mohammed-max/aihat-cli/releases/latest).
+
+| Your computer | Download |
+| --- | --- |
+| **Windows** (most PCs) | [aihat-windows-x64.exe](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-windows-x64.exe) |
+| Windows on ARM (Surface Pro X, Snapdragon laptops) | [aihat-windows-arm64.exe](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-windows-arm64.exe) |
+| Windows, older 32-bit | [aihat-windows-x86.exe](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-windows-x86.exe) |
+| **Mac** (any Mac) | [aihat-macos-universal.dmg](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-macos-universal.dmg) |
+| **Ubuntu, Debian, Linux Mint, Pop!_OS, Raspberry Pi OS** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-debian-amd64.deb) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-debian-arm64.deb) · [ARM 32-bit](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-debian-armhf.deb) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-debian-i386.deb) · [RISC-V](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-debian-riscv64.deb) |
+| **Fedora, RHEL, Rocky, AlmaLinux, openSUSE** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-fedora-x86_64.rpm) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-fedora-aarch64.rpm) · [ARM 32-bit](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-fedora-armv7hl.rpm) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-fedora-i686.rpm) · [RISC-V](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-fedora-riscv64.rpm) |
+| **Arch Linux, Manjaro, EndeavourOS, Arch Linux ARM** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-arch-x86_64.pkg.tar.zst) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-arch-aarch64.pkg.tar.zst) · [ARM 32-bit](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-arch-armv7h.pkg.tar.zst) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-arch-i686.pkg.tar.zst) · [RISC-V](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-arch-riscv64.pkg.tar.zst) |
+| **Alpine Linux** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-alpine-x86_64.apk) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-alpine-aarch64.apk) · [ARM 32-bit](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-alpine-armv7.apk) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-alpine-x86.apk) · [RISC-V](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-alpine-riscv64.apk) |
+| **Any other Linux** (Gentoo, Void, NixOS, Slackware, ChromeOS Linux…) | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-linux-musl-x86_64.tar.gz) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-linux-musl-aarch64.tar.gz) · [ARM 32-bit](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-linux-musl-armv7.tar.gz) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-linux-musl-x86.tar.gz) · [RISC-V](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-linux-musl-riscv64.tar.gz) |
+| **FreeBSD** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-freebsd-amd64.pkg) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-freebsd-aarch64.pkg) · [32-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-freebsd-i386.tar.gz) |
+| **OpenBSD** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-openbsd-amd64.tgz) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-openbsd-arm64.tgz) |
+| **NetBSD** | [64-bit PC](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-netbsd-amd64.tgz) · [ARM64](https://github.com/aman-mohammed-max/aihat-cli/releases/latest/download/aihat-netbsd-arm64.tgz) |
+
+<details>
+<summary><b>Not sure which one you need?</b></summary>
+
+On Linux, macOS or BSD, open a terminal and type `uname -m`:
+
+| It says | Pick |
+| --- | --- |
+| `x86_64` or `amd64` | 64-bit PC |
+| `aarch64` or `arm64` | ARM64 |
+| `armv7l` | ARM 32-bit |
+| `i686` or `i386` | 32-bit PC |
+| `riscv64` | RISC-V |
+
+On Windows, open **Settings → System → About** and look at **System type**.
+
+</details>
+
+## Install
+
+<details open>
+<summary><b>Windows</b></summary>
+
+1. Download the `.exe` for your PC.
+2. Rename it to `aihat.exe` and move it into a folder of its own, like `C:\Program Files\AI Hat`.
+3. Open **Windows Terminal** and run it: `& "C:\Program Files\AI Hat\aihat.exe"`
+
+To type just `aihat` from anywhere, add that folder to your PATH: search the Start menu for *Edit the system environment variables* → **Environment Variables** → **Path** → **New**.
+
+If Windows SmartScreen says it protected your PC, click **More info → Run anyway**. AI Hat isn't code-signed yet.
+
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+1. Open the `.dmg`.
+2. In **Terminal**, run the installer inside it:
+   ```sh
+   sudo /Volumes/"AI Hat CLI"/install.sh
+   ```
+3. Type `aihat` to start.
+
+If macOS says the app can't be checked for malicious software, run `xattr -d com.apple.quarantine /usr/local/bin/aihat` once. AI Hat isn't notarized yet.
+
+</details>
+
+<details>
+<summary><b>Linux</b></summary>
+
+Open a terminal in the folder you downloaded to:
+
+| System | Command |
+| --- | --- |
+| Ubuntu, Debian, Mint… | `sudo apt install ./aihat-debian-*.deb` |
+| Fedora, RHEL… | `sudo dnf install ./aihat-fedora-*.rpm` |
+| openSUSE | `sudo zypper install ./aihat-fedora-*.rpm` |
+| Arch, Manjaro… | `sudo pacman -U ./aihat-arch-*.pkg.tar.zst` |
+| Alpine | `sudo apk add --allow-untrusted ./aihat-alpine-*.apk` |
+| Any other Linux | `tar -xzf aihat-linux-*.tar.gz && sudo install aihat /usr/local/bin/` |
+
+Then type `aihat`.
+
+</details>
+
+<details>
+<summary><b>FreeBSD, OpenBSD, NetBSD</b></summary>
+
+| System | Command |
+| --- | --- |
+| FreeBSD | `sudo pkg add ./aihat-freebsd-*.pkg` |
+| OpenBSD | `doas pkg_add -D unsigned ./aihat-openbsd-*.tgz` |
+| NetBSD | `sudo pkg_add ./aihat-netbsd-*.tgz` |
+
+Then type `aihat`.
+
+</details>
+
+## Get started
+
+**1. Connect a model.** AI Hat talks to any service that speaks the OpenAI API: a cloud service like OpenRouter or Groq, or a model on your own computer with Ollama or LM Studio.
+
+```sh
+aihat providers add
+```
+
+Pick a preset, paste your API key (if it needs one), and AI Hat tests the connection and finds your models.
+
+**2. Start chatting.**
+
+```sh
+aihat
+```
+
+Type a message and press **Enter**. Press **?** to see every key.
+
+**3. Or ask a quick question** without opening the full screen:
+
+```sh
+aihat "explain this error" -f crash.log
+```
+
+Already use the AI Hat app on this computer? Your providers, prompts and chats are already here.
+
+## What it can do
+
+- **💬 Any model, one place.** Switch models with **Ctrl+P**, system prompts with **Ctrl+S**, and pick up old chats with **Ctrl+R**.
+- **🌐 Searches the web** and shows its sources: type `/search` or turn it on in `/tools`.
+- **📎 Reads your files.** Type `@` to attach a file or a web page; pictures too, for models that can see.
+- **🎨 Draws pictures.** `/image a lighthouse in a storm` shows a preview right in the terminal, then asks where to save it.
+- **🔌 Connects to tools (MCP).** Add GitHub, Linear, Notion, a database and more. Sign-in happens in your browser, automatically.
+- **🧩 Learns skills.** Add a skill from a folder or a GitHub link: `aihat skills add https://github.com/anthropics/skills/tree/main/skills/xlsx`
+- **🧠 Remembers you.** Your name, projects and preferences carry across chats. See and edit them with `/memory`.
+- **⌨️ Works your way.** Every shortcut, colour and option is in one file: `aihat config edit`.
+- **🔒 Private by default.** Chats stay on your computer. API keys go to your system keychain (or a private file only you can read on Linux and BSD). Nothing leaves your computer except what goes to the models, search and tools you set up.
+
+## Keys
 
 | Key | Does |
 | --- | --- |
-| enter | send |
-| shift+enter, alt+enter, ctrl+j | new line (also `\` then enter) |
-| esc | stop the reply (the partial reply is kept) |
-| ↑ in an empty box | edit your last message; ↑ again for older prompts |
-| ctrl+p | switch model (tab: this chat or the default · ctrl+e: model defaults) |
-| ctrl+s | switch system prompt |
-| ctrl+r | past chats (ctrl+d delete · ctrl+e export · ctrl+n new) |
-| ctrl+n | new chat |
-| ctrl+l | clear the screen (the chat stays saved) |
-| ctrl+o | show or hide reasoning |
-| ctrl+y | copy the last reply (works over SSH too) |
-| pgup, pgdn | scroll |
-| ctrl+c | clear the box, stop a reply, or press twice to quit |
-| ? | every key |
+| **Enter** | Send |
+| **Shift+Enter** | New line |
+| **Esc** | Stop the reply |
+| **↑** | Edit your last message |
+| **Ctrl+P** | Switch model |
+| **Ctrl+S** | Switch system prompt |
+| **Ctrl+R** | Past chats |
+| **Ctrl+N** | New chat |
+| **/** | All commands |
+| **@** | Attach a file |
+| **?** | Every key |
+| **Ctrl+C** twice | Quit |
 
-Every key in the first column of this table can be changed in `settings.json` (see [Settings](#settings)).
+## Help
 
-Typing `/` lists commands: `/model`, `/prompt`, `/providers`, `/tools`, `/mcp`, `/skills`, `/new`, `/resume`, `/compact`, `/export [json]`, `/image <idea>` (improves the prompt, then draws; `--raw` skips that), `/search <query>`, `/refresh`, `/rename`, `/copy`, `/clear`, `/memory` (what models remember; on or off for this chat), `/keys`, `/settings` (opens `settings.json` in your editor), `/quit`.
+**"Can't reach the provider"** — check the address with `aihat providers` and test it with `aihat providers test NAME`. For a model on your own computer, make sure Ollama or LM Studio is running.
 
-The mouse wheel scrolls the chat. Scrolled up, a **↓ Jump to bottom** button appears at the bottom right; click it or press end. Hold shift to select text with the mouse (or set `"mouse": false` in settings.json).
+**"Key rejected (401)"** — save the key again: `aihat providers set-key NAME`.
 
-- `@path` attaches a file (a picker opens as you type, respecting `.gitignore`); `@https://…` attaches a page.
-- `!command` runs a shell command and attaches its output to your next message.
-- `#note` saves a note to this chat's system prompt.
+**Colours look wrong** — your terminal may not tell AI Hat it supports full colour. Run `aihat config set colors truecolor`. For the intended look, use the JetBrains Mono font.
 
-`/providers` shows endpoints on the left and the selected one's details on the right: `a` add, `t` test, `d` default, `e` edit, `k` key, `x` remove, `r` refresh models, tab to the model list, space to show or hide a model in the picker, enter to edit defaults (temperature, max tokens, timeout, headers).
+**Something else?** [Open an issue](https://github.com/aman-mohammed-max/aihat-cli/issues) and say what you typed and what happened.
 
-`/tools` turns web search, memory, MCP servers and skills on or off for the chat. Tools that write data ask first, with "Allow once", "Always for this server", "Edit the arguments" or "Deny".
+The [full guide](docs/GUIDE.md) covers every command, setting and feature.
 
-## MCP servers
+## For developers
 
-aihat is a full MCP client. A server is either remote (an `https://…/mcp` address) or a program on this computer that talks over stdin and stdout:
+Build from source with a current [Rust](https://rustup.rs) toolchain:
 
-    aihat mcp add linear https://mcp.linear.app/mcp
-    aihat mcp add postgres -- npx -y @modelcontextprotocol/server-postgres $DB_URL
-
-Servers that need a sign-in get one the way the MCP specification describes it (OAuth with PKCE, registered on the fly). aihat opens your browser, waits for it to come back to a one-off address on 127.0.0.1, keeps the tokens with your keys, and renews them when they run out. This happens on its own when you add a server, refresh it, or use it in a chat. If there is no web browser on the computer (over SSH, say), it says so; servers that take a pasted token ask for one instead (`aihat mcp set-key NAME`, or `k` in `/mcp`). `aihat mcp login NAME` and `logout`, or `s` and `o` in `/mcp`, sign in and out by hand.
-
-Programs added with `--` start the first time they're needed and stop when aihat exits.
-
-## Skills
-
-A skill is a folder with a `SKILL.md`, from this computer or from GitHub:
-
-    aihat skills add ./my-skill
-    aihat skills add https://github.com/anthropics/skills/tree/main/skills/xlsx
-    aihat skills show github.com/anthropics/skills/tree/main/skills/pdf     # read it first
-    aihat skills update                                                      # read every skill again
-
-The files next to `SKILL.md` (references, templates, scripts) come along as text so the model can read them; scripts are never run. In `/skills`, `a` adds a folder or a GitHub link and `r` reads the selected skill again.
-
-## Memory
-
-Memory is shared by every chat, like in the app. Models that can use tools keep it themselves (they save, correct and forget single memories, never all of them); for models that can't, a short request after each reply picks out what is worth keeping. `/memory` lists what is saved: `m` turns it on or off for this chat, `g` everywhere, `a` adds one and `d` forgets one. From the command line: `aihat memory`, `aihat memory add "I work in Rust"`, `aihat memory forget 2`, `aihat memory off`.
-
-The layout works from 80×24 up; under 100 columns the header drops the folder and dialogs go full width. The chat fills the whole terminal; replies wrap at 90 columns so they stay easy to read. To get the design's 112-column window instead, centred, set `"width": 112` in settings.json (`0` fills the terminal).
-
-## Pictures
-
-`/image a lighthouse in a storm` improves the idea into a fuller prompt, draws it, and shows a small preview over the chat with **Save to ~/Downloads**, **Save as…**, **Copy the picture** or **Discard**. Nothing is written until you choose; Save never overwrites a file. Saved pictures show as small previews in the chat, and so do pictures you attach with `@`.
-
-Previews are drawn with coloured half blocks, which work in any terminal with colour. Terminals that can show real pictures (kitty, Ghostty, WezTerm, iTerm2, foot, Konsole, Windows Terminal) get a sharp preview instead. To choose yourself:
-
-    aihat config set images.preview iterm2     # or kitty, sixel, blocks, off
-
-## Commands
-
-    aihat --help
-    aihat providers [list|add|test|set-default|set-key|set-url|remove]
-    aihat models [list [--all]|refresh|set-default MODEL|add MODEL] [-P PROVIDER]
-    aihat prompts [list [--search WORD]|show|add|use|delete]
-    aihat chats [list|show N|open N|export N [--json] [-o FILE]|rename|archive|delete]
-    aihat mcp [list|add NAME URL|add NAME -- COMMAND|login|logout|start|refresh|set-key|allow|ask|remove]
-    aihat skills [list|add PATH_OR_LINK|update|enable|disable|show|remove]
-    aihat config [path|get [KEY]|set KEY VALUE|edit]
-    aihat memory [list|add TEXT|forget N|on|off|clear]
-    aihat backup [export [-o FILE]|import FILE]
-    aihat search-key [set|remove] brave|tavily
-    aihat image "a lighthouse in a storm" --count 2 [-o FILE_OR_FOLDER]
-
-`aihat image` shows each picture's preview and asks where to save it; with `-o`, `--yes`, or output to a pipe it saves without asking (to `-o`, or the `images.save_to` folder) and prints the path.
-
-Chats are numbered in the order they were made (`aihat chats` shows `#41`), so `aihat chats export 41 > notes.md` works.
-
-## One prompt
-
-    aihat "what changed in the Fabric API this month?" -w
-    cat crash.log | aihat -s "Rust Systems Mentor" "why does this panic?"
-    aihat -c "add a timeout on the join too"
-    aihat "summarise" -f notes.md --json | jq .usage
-    aihat "open an issue for this" -t github --yes
-
-Options: `-m` model, `-P` provider, `-s` saved system prompt, `-f` file (repeatable; piped stdin is attached too), `-w` web search, `-c` continue the last chat, `-t` MCP server (repeatable), `--json`, `--no-stream`, `-y` approve tools and confirmations, `--no-color`, `--ascii`.
-
-The reply goes to stdout and progress goes to stderr, so `aihat "…" > answer.md` saves only the answer. When stdout is not a terminal there are no colours or spinners, just the reply text. `--json` prints the reply, usage, sources and tool calls.
-
-Exit codes: 0 ok · 1 error · 2 bad usage · 3 provider unreachable · 4 key rejected · 130 stopped with ctrl+c (the partial reply is saved; `aihat -c` continues it).
-
-## Web search
-
-Web search uses the provider by default: its `/search` endpoint, or Google Search grounding for FreeLLMAPI (a Gemini 2.5 Flash model must be available there). To use another engine:
-
-    aihat search-key set brave
-    aihat config set search.engine brave
-    aihat config set search.engine searxng
-    aihat config set search.url https://your-searxng.example
-
-## Colours
-
-The palette follows the design: near-black background, lime accent, grey text, cyan commands and links, orange warnings, soft red errors, purple code keywords and reasoning. Terminals with 24-bit colour get the exact colours. That includes terminals that support it without saying so through `COLORTERM`, like the ChromeOS terminal. 256-colour and 16-colour terminals get the closest ones. `NO_COLOR` or `--no-color` turns colours off, and every state also has a glyph (✓ ✗ ! ●), so nothing depends on colour alone. `aihat config set accent "#7DD3FC"` changes the accent, and `aihat config set colors 256` picks the colour depth (`auto`, `truecolor`, `256`, `16`, `none`).
-
-For the design's exact look, also set your terminal's font to JetBrains Mono.
-
-## Data
-
-The data folder is the AI Hat desktop app's: `~/.local/share/com.amanm.aihat` on Linux, and the platform's application data folder on macOS and Windows. `AIHAT_DATA_DIR` and `AIHAT_DB_PATH` point at another copy:
-
-    AIHAT_DB_PATH=/path/to/aihat.db aihat
-
-Options live in `~/.config/aihat/settings.json` (`aihat config path` shows every location). An older `config.toml` is moved into it once and kept as `config.toml.bak`.
-
-## Settings
-
-`~/.config/aihat/settings.json` is written with every option and its default the first time aihat runs. Edit it with `aihat config edit` (or `/settings` in the chat), or one option at a time with `aihat config set keys.switch_model f2`.
-
-```json
-{
-  "accent": "#C6F46B",
-  "colors": "auto",
-  "ascii": false,
-  "width": 0,
-  "show_reasoning": false,
-  "show_stats": true,
-  "mouse": true,
-  "images": { "preview": "auto", "save_to": "~/Downloads" },
-  "search": { "engine": "provider", "url": "", "results": 6 },
-  "keys": {
-    "send": "enter",
-    "new_line": ["shift+enter", "alt+enter", "ctrl+j"],
-    "stop": "esc",
-    "switch_model": "ctrl+p",
-    "switch_prompt": "ctrl+s",
-    "past_chats": "ctrl+r",
-    "new_chat": "ctrl+n",
-    "clear_screen": "ctrl+l",
-    "toggle_reasoning": "ctrl+o",
-    "copy_reply": "ctrl+y",
-    "show_keys": "?",
-    "quit": "ctrl+c"
-  }
-}
+```sh
+git clone https://github.com/aman-mohammed-max/aihat-cli
+cd aihat-cli
+cargo build --release      # the program is target/release/aihat
 ```
 
-A key is written like `ctrl+p`, `alt+enter`, `shift+tab`, `f2` or a single character; give a list for several. The hints on screen and the keys dialog follow your bindings, and ctrl+c always quits. A key aihat can't read is reported when the chat opens, and that action keeps its default. If the file has a JSON mistake, aihat says which line and `aihat config edit` still opens it.
+Every push is built and packaged for every platform by [the build workflow](.github/workflows/release.yml); pushing a version tag such as `v0.1.0` publishes a release with all the files above and their SHA-256 checksums.
 
-## Release builds
+## License
 
-[The build workflow](.github/workflows/release.yml) runs on every push and pull request: it tests the CLI, then builds and packages it for every platform, so a broken target shows up right away. Pushing a version tag such as `v0.1.0` also publishes a GitHub Release with every file and SHA-256 checksums:
-
-| Platform | Files |
-| --- | --- |
-| Windows | `aihat-windows-x64.exe`, `-x86.exe`, `-arm64.exe` (portable, nothing to install) |
-| macOS | `aihat-macos-universal.dmg`, `-apple-silicon.dmg`, `-intel.dmg` |
-| Debian, Ubuntu, Mint, Raspberry Pi OS… | `aihat-debian-{amd64,i386,arm64,armhf,riscv64}.deb` |
-| Fedora, RHEL, openSUSE… | `aihat-fedora-{x86_64,i686,aarch64,armv7hl,riscv64}.rpm` |
-| Arch, Manjaro, Arch Linux ARM… | `aihat-arch-{x86_64,i686,aarch64,armv7h,riscv64}.pkg.tar.zst` |
-| Alpine | `aihat-alpine-{x86_64,x86,aarch64,armv7,riscv64}.apk` |
-| Any Linux | `aihat-linux-*.tar.gz` (the `musl-*` ones are static and run on any distribution) |
-| FreeBSD | `aihat-freebsd-{amd64,aarch64}.pkg`, `aihat-freebsd-i386.tar.gz` |
-| OpenBSD | `aihat-openbsd-{amd64,arm64}.tgz` (`pkg_add -D unsigned`) |
-| NetBSD | `aihat-netbsd-{amd64,arm64}.tgz` |
+MIT
