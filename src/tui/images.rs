@@ -408,7 +408,7 @@ pub fn drawing_lines(prompt: &str, stage: &str, elapsed_ms: u64, layout: super::
     let detail = text::truncate(&format!("\"{prompt}\""), layout.width.saturating_sub(12));
     vec![
         Line::from(vec![
-            Span::styled(" ● ", t.fg(Role::Accent)),
+            Span::styled(format!(" {} ", super::anim::spinner()), t.fg(Role::Accent)),
             Span::styled("image ", t.fg(Role::Dim)),
             Span::styled(detail, t.fg(Role::Text)),
         ]),

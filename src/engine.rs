@@ -40,15 +40,20 @@ pub struct TurnSpec {
     pub messages: Vec<Value>,
     /// Offer the web_search tool.
     pub web: bool,
+    /// The folder the person allowed the assistant to read (and to ask to
+    /// run commands in).
+    pub folder: Option<PathBuf>,
 }
 
-/// A write tool waiting for the user's answer.
+/// A write tool, or a command, waiting for the user's answer.
 #[derive(Clone, Debug)]
 pub struct Approval {
     pub server: String,
     pub tool: String,
     pub writes: bool,
     pub arguments: Value,
+    /// Set for a command the assistant wants to run: the folder it runs in.
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +370,10 @@ pub fn run_turn(
         if spec.web || spec.chat.search_mode || search_auto {
             definitions.push(search::tool_definition());
         }
+        if let Some(dir) = &spec.folder {
+            definitions.extend(crate::folder::tool_definitions());
+            append_system(&mut spec.messages, &crate::folder::instruction(dir));
+        }
     }
     if spec.web {
         if supports_tools {
@@ -430,7 +439,7 @@ pub fn run_turn(
                 output.cancelled = true;
                 break;
             }
-            let log = run_tool(ctx, &db, &spec.chat, &mcp_tools, call, &mut output, cancel, sink);
+            let log = run_tool(ctx, &db, &spec.chat, spec.folder.as_deref(), &mcp_tools, call, &mut output, cancel, sink);
             spec.messages.push(json!({
                 "role": "tool",
                 "tool_call_id": log["tool_call_id"],
@@ -558,7 +567,7 @@ pub fn tool_label(name: &str, args: &Value, mcp_tools: &[DiscoveredTool]) -> Too
 
 /// The most telling argument of a call: a query, a path, or compact JSON.
 pub fn argument_summary(args: &Value) -> String {
-    for key in ["query", "q", "name", "path", "url", "title", "action"] {
+    for key in ["command", "query", "q", "name", "path", "url", "title", "action"] {
         if let Some(value) = args.get(key).and_then(Value::as_str) {
             return format!("\"{}\"", crate::ui::text::truncate(value, 80));
         }
@@ -570,10 +579,12 @@ pub fn argument_summary(args: &Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tool(
     ctx: &Context,
     db: &Database,
     chat: &Chat,
+    folder: Option<&std::path::Path>,
     mcp_tools: &[DiscoveredTool],
     call: &Value,
     output: &mut TurnOutput,
@@ -614,6 +625,49 @@ fn run_tool(
                 .ok_or_else(|| format!("No enabled skill named {wanted:?}."))
         }
         "read_skill_file" => read_skill_file(db, &args),
+        "list_files" | "read_file" | "search_files" => match folder {
+            Some(root) => crate::folder::read_tool(root, &name, &args),
+            None => Err("The user hasn't allowed reading this folder.".into()),
+        },
+        "run_command" => match folder {
+            Some(root) => {
+                let mut command = args.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let mut allowed = crate::folder::allowed_commands(db, root).contains(&command);
+                if !allowed && !command.is_empty() {
+                    let request = Approval {
+                        server: "AI Hat".into(),
+                        tool: "run_command".into(),
+                        writes: true,
+                        arguments: args.clone(),
+                        folder: Some(crate::ui::text::home_relative(root)),
+                    };
+                    match sink.approve(&request) {
+                        Decision::Once => allowed = true,
+                        Decision::AlwaysForServer => {
+                            allowed = true;
+                            if let Err(error) = crate::folder::allow_command(db, root, &command) {
+                                sink.warning(&format!("Could not save the approval: {error}"));
+                            }
+                        }
+                        Decision::Edited(edited) => {
+                            command = edited.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                            args = edited;
+                            log["args"] = args.clone();
+                            log["detail"] = json!(argument_summary(&args));
+                            allowed = !command.is_empty();
+                        }
+                        Decision::Deny => {}
+                    }
+                }
+                if allowed {
+                    crate::folder::run_command(root, &command, cancel)
+                } else {
+                    log["status"] = json!("rejected");
+                    Ok("The user declined to run this command.".into())
+                }
+            }
+            None => Err("The user hasn't allowed running commands in this folder.".into()),
+        },
         "web_search" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_string();
             match search::search_with_metrics(db, &ctx.secrets, &ctx.config, &query) {
@@ -653,6 +707,7 @@ fn run_tool(
                         tool: found.tool.name.clone(),
                         writes: found.tool.kind != "read",
                         arguments: args.clone(),
+                        folder: None,
                     };
                     match sink.approve(&request) {
                         Decision::Once => {}

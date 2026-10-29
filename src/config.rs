@@ -81,6 +81,8 @@ pub struct AppConfig {
     /// The mouse wheel scrolls the chat and buttons can be clicked. Hold
     /// shift to select text with the mouse while this is on.
     pub mouse: bool,
+    /// Spinners, the pulsing dot and the other small animations.
+    pub animations: bool,
     pub images: ImageConfig,
     pub search: SearchConfig,
     pub skills: SkillsConfig,
@@ -186,6 +188,7 @@ impl Default for AppConfig {
             show_reasoning: false,
             show_stats: true,
             mouse: true,
+            animations: true,
             images: ImageConfig::default(),
             search: SearchConfig::default(),
             skills: SkillsConfig::default(),

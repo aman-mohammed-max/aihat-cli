@@ -122,6 +122,8 @@ pub struct MarketPage {
     token: u64,
     search_due: Option<Instant>,
     detail_due: Option<Instant>,
+    /// Rows the details pane is scrolled down (PgUp/PgDn).
+    detail_scroll: usize,
     details: HashMap<String, Detail>,
 }
 
@@ -142,6 +144,7 @@ impl MarketPage {
             // The first list loads straight away.
             search_due: Some(Instant::now()),
             detail_due: None,
+            detail_scroll: 0,
             details: HashMap::new(),
         }
     }
@@ -306,6 +309,7 @@ pub fn on_results(app: &mut App, token: u64, result: Result<Found, String>) {
             } else {
                 page.items = found.items;
                 page.selection = 0;
+                page.detail_scroll = 0;
                 page.title = found.title;
             }
             page.more = found.more;
@@ -476,6 +480,9 @@ fn draw_detail(app: &App, page: &MarketPage, buf: &mut Buffer, area: Rect) {
             write(buf, y, line);
         }
     };
+    let markdown = |source: &str| {
+        crate::ui::markdown::render(source, crate::ui::markdown::MdOptions { width: w, indent: 0, block_indent: 1, wide: w })
+    };
     let detail = page.details.get(&item.key()).cloned();
     match item {
         Item::Suggestion { title, sub, meta, .. } => {
@@ -497,7 +504,7 @@ fn draw_detail(app: &App, page: &MarketPage, buf: &mut Buffer, area: Rect) {
             write(buf, &mut y, Line::styled(format!("Listed on {}", skill.from.label()), t.fg(Role::Dim)));
             y += 1;
             if let Some(description) = &skill.description {
-                for line in wrap(description, Role::Text, 5) {
+                for line in markdown(description).into_iter().take(5) {
                     write(buf, &mut y, line);
                 }
                 y += 1;
@@ -508,11 +515,21 @@ fn draw_detail(app: &App, page: &MarketPage, buf: &mut Buffer, area: Rect) {
                 Some(Detail::Skill { body, files }) => {
                     let title = if files > 0 { format!("Instructions (SKILL.md) · {}", text::plural(files, "file", "files")) } else { "Instructions (SKILL.md)".into() };
                     write(buf, &mut y, Line::styled(title, t.fg(Role::Strong)));
-                    for raw in body.lines().filter(|l| !l.trim().is_empty()) {
+                    y += 1;
+                    // SKILL.md drawn as in a reply: headings, lists, tables, code.
+                    let rendered = markdown(&body);
+                    let room = last.saturating_sub(y + 1) as usize;
+                    let skip = page.detail_scroll.min(rendered.len().saturating_sub(room.max(1)));
+                    let total = rendered.len();
+                    for line in rendered.into_iter().skip(skip) {
                         if y + 1 >= last {
                             break;
                         }
-                        write(buf, &mut y, Line::styled(text::truncate(raw, w), t.fg(Role::Dim)));
+                        write(buf, &mut y, line);
+                    }
+                    if total > room {
+                        let shown = format!("{}–{} of {} rows · pgup/pgdn", skip + 1, (skip + room).min(total), total);
+                        put(buf, inner.right().saturating_sub(text::width(&shown) as u16), area.y, &format!(" {shown} "), t.fg(Role::Dim), inner.right() + 1);
                     }
                 }
                 Some(Detail::Failed(error)) => {
@@ -532,7 +549,7 @@ fn draw_detail(app: &App, page: &MarketPage, buf: &mut Buffer, area: Rect) {
             };
             write(buf, &mut y, Line::styled(by, t.fg(Role::Dim)));
             y += 1;
-            for line in wrap(&server.description, Role::Text, 5) {
+            for line in markdown(&server.description).into_iter().take(6) {
                 write(buf, &mut y, line);
             }
             y += 1;
@@ -573,6 +590,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
         return;
     };
     let moved = |page: &mut MarketPage, to: usize| {
+        page.detail_scroll = 0;
         page.selection = to.min(page.items.len().saturating_sub(1));
         page.detail_soon();
     };
@@ -601,14 +619,9 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
             let to = page.selection + 1;
             moved(page, to);
         }
-        KeyCode::PageUp => {
-            let to = page.selection.saturating_sub(10);
-            moved(page, to);
-        }
-        KeyCode::PageDown => {
-            let to = page.selection + 10;
-            moved(page, to);
-        }
+        // Page keys scroll the details, to read a skill in full.
+        KeyCode::PageUp => page.detail_scroll = page.detail_scroll.saturating_sub(10),
+        KeyCode::PageDown => page.detail_scroll += 10,
         KeyCode::Backspace => {
             page.query.pop();
             page.typed();

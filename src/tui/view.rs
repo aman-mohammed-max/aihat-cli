@@ -50,6 +50,7 @@ pub const COMMANDS: &[Command] = &[
     command("keys", "show every key", Some(Action::ShowKeys), false),
     command("settings", "open settings.json", None, false),
     // After the design's list: commands added since.
+    command("folder", "let the assistant read this folder · run commands", None, false),
     command("market", "find skills and MCP servers to add", None, false),
     command("effort", "how much the model thinks: off, low, medium, high", None, false),
     command("newprompt", "describe an assistant · the model writes its system prompt", None, true),
@@ -201,9 +202,20 @@ fn draw_welcome(app: &App, buf: &mut Buffer, area: Rect) {
         Line::default(),
     ];
     for (row, ((logo, indent), text_line)) in LOGO.iter().zip(beside.iter()).enumerate() {
-        let x = put(buf, area.x + *indent as u16, y + row as u16, logo, t.fg(Role::Accent), right);
-        let _ = x;
+        put(buf, area.x + *indent as u16, y + row as u16, logo, t.fg(Role::Accent), right);
         put_line(buf, area.x + 13, y + row as u16, text_line, right);
+    }
+    // When aihat opens, a light passes over the hat, left to right.
+    if let Some(column) = super::anim::intro_column() {
+        for row in 0..LOGO.len() as u16 {
+            for x in [column, column + 1] {
+                if let Some(cell) = buf.cell_mut((area.x + x, y + row))
+                    && cell.symbol() != " "
+                {
+                    cell.set_style(t.fg(Role::Strong));
+                }
+            }
+        }
     }
     y += 5;
     if y >= area.bottom() {
@@ -368,18 +380,23 @@ pub fn turn_blocks(turn: &ActiveTurn, layout: Layout) -> Vec<Rc<Vec<Line<'static
             Some(ms) => format!("Thought for {}", text::seconds(ms)),
             None => format!("Thinking… {}", text::seconds(elapsed)),
         };
-        body.extend(transcript::reasoning_lines(&turn.reasoning, &label, layout));
+        let mut lines = transcript::reasoning_lines(&turn.reasoning, &label, layout);
+        if turn.reasoning_ms.is_none()
+            && let Some(first) = lines.first_mut()
+        {
+            super::anim::shimmer_in(first, "Thinking…", t.fg(Role::Strong));
+        }
+        body.extend(lines);
     } else if !answering && !waiting_on_tool {
-        body.push(Line::from(vec![
-            Span::styled(" ◇ ", t.fg(Role::Code)),
-            Span::styled(format!("Thinking… {}", text::seconds(elapsed)), t.fg(Role::Dim)),
-        ]));
+        let mut line = Line::from(vec![Span::styled(" ◇ ", t.fg(Role::Code)), Span::styled(format!("Thinking… {}", text::seconds(elapsed)), t.fg(Role::Dim))]);
+        super::anim::shimmer_in(&mut line, "Thinking…", t.fg(Role::Strong));
+        body.push(line);
     }
     if answering {
         let mut answer = transcript::answer_lines(&turn.content, layout);
         // The block cursor that shows the reply is still arriving.
         if let Some(last) = answer.last_mut().filter(|_| turn.approval.is_none()) {
-            last.spans.push(Span::styled(" ", t.cursor()));
+            last.spans.push(if super::anim::cursor_on() { Span::styled(" ", t.cursor()) } else { Span::raw(" ") });
         }
         body.extend(answer);
     }
@@ -428,7 +445,14 @@ fn draw_composer(app: &App, buf: &mut Buffer, area: Rect) {
     let t = theme();
     let active = !app.composer.is_empty() && app.dialog.is_none();
     let border = if active { t.fg(Role::Accent) } else { t.fg(Role::Dim) };
-    draw::boxed(buf, area, border, "", "");
+    // What goes with the next message (a pasted picture, command output).
+    let attached = if app.staged.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = app.staged.iter().map(|a| if a.kind == "image" { "picture" } else { a.name.as_str() }).collect();
+        format!("+ {} · esc removes", text::truncate(&names.join(", "), 40))
+    };
+    draw::boxed(buf, area, border, "", &attached);
     let x = area.x + 2;
     let y = area.y + 1;
     let right = area.right() - 2;
@@ -510,9 +534,9 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
         }
         Page::Market(page) => {
             if let Some(task) = &app.busy_task {
-                right.push(Span::styled(format!("● {task}"), t.fg(Role::Warn)));
+                right.push(Span::styled(format!("{} {task}", super::anim::spinner()), t.fg(Role::Warn)));
             } else if page.loading {
-                right.push(Span::styled("● searching", t.fg(Role::Warn)));
+                right.push(Span::styled(format!("{} searching", super::anim::spinner()), t.fg(Role::Warn)));
             } else {
                 right.push(Span::styled(text::plural(page.items.len(), "result", "results"), dim));
             }
@@ -520,13 +544,15 @@ fn draw_status(app: &App, buf: &mut Buffer, area: Rect) {
         Page::Chat => {
             let context = context_label(app, narrow);
             if let Some(turn) = &app.turn {
-                let state = if turn.approval.is_some() || turn.signing_in.is_some() { "● waiting for you" } else { "● streaming" };
-                right.push(Span::styled(state, t.fg(Role::Warn)));
+                let state = if turn.approval.is_some() || turn.signing_in.is_some() { "waiting for you" } else { "streaming" };
+                let dot = if super::anim::pulse() { t.fg(Role::Warn) } else { t.fg(Role::Dim) };
+                right.push(Span::styled("●", dot));
+                right.push(Span::styled(format!(" {state}"), t.fg(Role::Warn)));
                 if !context.is_empty() {
                     right.push(Span::styled(format!(" · {context}"), dim));
                 }
             } else if let Some(task) = &app.busy_task {
-                right.push(Span::styled(format!("● {task}"), t.fg(Role::Warn)));
+                right.push(Span::styled(format!("{} {task}", super::anim::spinner()), t.fg(Role::Warn)));
             } else {
                 let latency = app
                     .current_selection()

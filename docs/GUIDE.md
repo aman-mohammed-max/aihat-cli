@@ -76,7 +76,7 @@ Programs added with `--` start the first time they're needed and stop when aihat
 
 ## Marketplace
 
-`/market` (or `/market mcp`) finds things to add, as on the phone app. **Tab** switches between skills and MCP servers, **←/→** picks where skills come from, typing searches, **enter** adds the selected one, and the right side shows it in full before you add it:
+`/market` (or `/market mcp`) finds things to add, as on the phone app. **Tab** switches between skills and MCP servers, **←/→** picks where skills come from, typing searches, **enter** adds the selected one, and the right side shows it in full before you add it, its SKILL.md drawn like a reply (**PgUp/PgDn** scroll it):
 
 - **Popular**: the most-installed skills in public GitHub repositories (claude-plugins.dev).
 - **skills.sh**: the open skills directory.
@@ -117,6 +117,18 @@ Global skills, the ones other coding agents use, work here too: `~/.agents/skill
 ## About
 
 `/about` and `aihat about` show who made AI Hat (Aman Mohammed), with links to the portfolio, GitHub, the phone app, and a place to report a problem; enter opens the selected link. Ask the assistant who made it and it says both: which model it is and who made that model, and that this app was made by Aman Mohammed.
+
+## Your folder
+
+The first time aihat opens in a folder it asks whether the assistant may read it: **Yes, allow this folder**, **Only for now**, or **No, keep it private** (only the arrow keys and enter answer, so typing straight away can't). `/folder` shows the answer and changes it.
+
+Allowed, the assistant can list, read and search the files in the folder and the folders inside it (what `.gitignore` leaves out is skipped, and nothing outside the folder can be read). It can also ask to run a command there; every command waits in a **Run this command?** box with the command and why: **Run it once**, **Always run this here** (that exact command, in this folder), **Edit the command**, or **Don't run it**. Commands stop after two minutes or when you press esc. Skills that come with scripts go through the same box. `/folder` lists the commands you always allow, and `c` clears them.
+
+For one prompt from the shell: `aihat --folder "why do the tests fail?"` (commands ask on the terminal; `--yes` allows them).
+
+## Pasting
+
+**Ctrl+V** pastes from the clipboard: a picture goes with your next message (the message box says `+ picture · esc removes`), files copied in a file manager are attached, and text is typed in. Dragging a picture file into the terminal attaches it too.
 
 ## Memory
 
@@ -205,6 +217,7 @@ Options live in `~/.config/aihat/settings.json` (`aihat config path` shows every
   "show_reasoning": false,
   "show_stats": true,
   "mouse": true,
+  "animations": true,
   "images": { "preview": "auto", "save_to": "~/Downloads" },
   "skills": { "use_global": true, "off": [] },
   "search": { "engine": "provider", "url": "", "results": 6 },

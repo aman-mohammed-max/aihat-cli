@@ -164,6 +164,8 @@ pub struct App {
     pub composer: Composer,
     pub page: Page,
     pub dialog: Option<Dialog>,
+    /// The folder the assistant may read, when the person allowed it.
+    pub folder: Option<std::path::PathBuf>,
     pub popup_selection: usize,
     pub popup_dismissed: Option<String>,
     pub turn: Option<ActiveTurn>,
@@ -232,6 +234,7 @@ impl App {
             composer: Composer::default(),
             page: Page::Chat,
             dialog: None,
+            folder: None,
             popup_selection: 0,
             popup_dismissed: None,
             turn: None,
@@ -267,6 +270,15 @@ impl App {
         };
         if let Some(id) = initial_chat {
             app.open_chat(&id)?;
+        }
+        // The folder aihat runs in: allowed before, kept private, or asked now.
+        if let Ok(dir) = std::env::current_dir() {
+            match crate::folder::access(&app.db, &dir) {
+                Some(crate::folder::Access::Allowed) => app.folder = Some(dir),
+                Some(crate::folder::Access::Denied) => {}
+                None if dir.parent().is_some() => app.dialog = Some(Dialog::Folder(super::folder::FolderDialog::new(dir, true))),
+                None => {}
+            }
         }
         Ok(app)
     }
@@ -485,6 +497,7 @@ impl App {
             model,
             messages,
             web,
+            folder: self.folder.clone(),
         };
         self.start_turn(spec);
     }
@@ -687,12 +700,28 @@ impl App {
         let Some(pending) = turn.approval.as_ref() else {
             return;
         };
-        let pretty = serde_json::to_string_pretty(&pending.request.arguments).unwrap_or_default();
+        // A command is edited as the command line itself.
+        let text = match (&pending.request.folder, pending.request.arguments.get("command").and_then(Value::as_str)) {
+            (Some(_), Some(command)) => command.to_string(),
+            _ => serde_json::to_string_pretty(&pending.request.arguments).unwrap_or_default(),
+        };
         turn.editing_args = true;
-        self.composer.set(pretty);
+        self.composer.set(text);
     }
 
     fn submit_edited_arguments(&mut self) {
+        let command = self.turn.as_ref().and_then(|turn| turn.approval.as_ref()).filter(|pending| pending.request.folder.is_some()).map(|pending| pending.request.arguments.clone());
+        if let Some(mut arguments) = command {
+            let line = self.composer.text().trim().to_string();
+            if line.is_empty() {
+                self.fail("Type the command to run, or esc to go back");
+                return;
+            }
+            arguments["command"] = json!(line);
+            self.composer.clear();
+            self.answer_approval(Decision::Edited(arguments));
+            return;
+        }
         match serde_json::from_str::<Value>(self.composer.text()) {
             Ok(value) if value.is_object() => {
                 self.composer.clear();
@@ -849,6 +878,10 @@ impl App {
             "memory" => self.dialog = Some(Dialog::Memory(dialogs::MemoryDialog::default())),
             "keys" | "help" => self.dialog = Some(Dialog::Keys),
             "about" | "version" => self.dialog = Some(Dialog::About(Default::default())),
+            "folder" | "workspace" | "access" => match std::env::current_dir() {
+                Ok(dir) => self.dialog = Some(Dialog::Folder(super::folder::FolderDialog::new(dir, false))),
+                Err(error) => self.fail(error.to_string()),
+            },
             "settings" | "config" => self.edit_settings = true,
             "quit" | "exit" | "q" => self.quit = true,
             "" => {}
@@ -1510,9 +1543,52 @@ impl App {
 
     // ---------------------------------------------------------------- keys
 
+    /// Ctrl+V: a picture on the clipboard goes with the next message, and so
+    /// do files copied in a file manager; text is typed in.
+    pub fn paste_clipboard(&mut self) {
+        match super::tasks::read_clipboard() {
+            Ok(super::tasks::Clip::Picture(picture)) => {
+                self.ok(format!("Picture attached · {} · esc removes it", picture.meta));
+                self.staged.push(picture);
+            }
+            Ok(super::tasks::Clip::Files(paths)) => {
+                let mut added = Vec::new();
+                for path in paths {
+                    match crate::files::read(&path) {
+                        Ok(file) => {
+                            added.push(file.name.clone());
+                            self.staged.push(file);
+                        }
+                        Err(error) => self.fail(format!("{error:#}")),
+                    }
+                }
+                if !added.is_empty() {
+                    self.ok(format!("Attached {} · esc removes", added.join(", ")));
+                }
+            }
+            Ok(super::tasks::Clip::Text(text)) => self.on_paste(&text),
+            Ok(super::tasks::Clip::Empty) => self.notify(Role::Dim, "The clipboard is empty"),
+            Err(error) => self.fail(format!("Could not read the clipboard: {error}")),
+        }
+    }
+
     pub fn on_paste(&mut self, text: &str) {
         if let Some(Dialog::Form(form)) = self.dialog.as_mut() {
             form.paste(text);
+            return;
+        }
+        // A picture dragged into the terminal arrives as its path.
+        if self.dialog.is_none()
+            && matches!(self.page, Page::Chat)
+            && let Some(path) = super::tasks::picture_path(text)
+        {
+            match crate::files::read(&path) {
+                Ok(picture) => {
+                    self.ok(format!("Picture attached · {} · esc removes it", picture.name));
+                    self.staged.push(picture);
+                }
+                Err(error) => self.fail(format!("{error:#}")),
+            }
             return;
         }
         if self.dialog.is_none() && matches!(self.page, Page::Chat) {
@@ -1731,6 +1807,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
             KeyCode::Char('u') if ctrl => self.composer.delete_to_start(),
             KeyCode::Char('k') if ctrl => self.composer.delete_to_end(),
             KeyCode::Char('w') if ctrl => self.composer.delete_word(),
@@ -1810,7 +1887,7 @@ impl App {
             self.composer.clear();
         } else if !self.staged.is_empty() {
             self.staged.clear();
-            self.notify(Role::Dim, "Removed the attached command output");
+            self.notify(Role::Dim, "Removed what was attached");
         }
     }
 

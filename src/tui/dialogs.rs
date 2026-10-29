@@ -28,6 +28,7 @@ pub enum Dialog {
     Memory(MemoryDialog),
     About(super::about::AboutDialog),
     Effort(EffortPicker),
+    Folder(super::folder::FolderDialog),
 }
 
 // ------------------------------------------------------------------ shared
@@ -2274,13 +2275,33 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
     let request = &pending.request;
     let border = t.fg(Role::Warn);
     let inner = total_width.saturating_sub(4).max(20);
-    let mut body: Vec<Line<'static>> = vec![Line::from(vec![
-        Span::styled(request.server.clone(), t.fg(Role::Strong)),
-        Span::styled(" wants to run ", t.fg(Role::Text)),
-        Span::styled(request.tool.clone(), t.fg(Role::Link)),
-    ])];
-    body.push(Line::default());
-    if let Some(map) = request.arguments.as_object() {
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if let Some(folder) = &request.folder {
+        // A command the assistant wants to run: the command line itself, and why.
+        body.push(Line::from(vec![Span::styled("The assistant wants to run this in ", t.fg(Role::Text)), Span::styled(folder.clone(), t.fg(Role::Link))]));
+        body.push(Line::default());
+        let command = request.arguments.get("command").and_then(Value::as_str).unwrap_or("");
+        for (index, row) in crate::ui::markdown::wrap_segments(&[(command.to_string(), t.bold(Role::Strong))], inner.saturating_sub(2)).into_iter().take(6).enumerate() {
+            let mut spans = vec![Span::styled(if index == 0 { "$ " } else { "  " }, t.fg(Role::Dim))];
+            spans.extend(row);
+            body.push(Line::from(spans));
+        }
+        if let Some(reason) = request.arguments.get("reason").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
+            body.push(Line::default());
+            for row in crate::ui::markdown::wrap_segments(&[(reason.to_string(), t.fg(Role::Dim))], inner).into_iter().take(3) {
+                body.push(Line::from(row));
+            }
+        }
+        body.push(Line::default());
+    } else {
+        body.push(Line::from(vec![
+            Span::styled(request.server.clone(), t.fg(Role::Strong)),
+            Span::styled(" wants to run ", t.fg(Role::Text)),
+            Span::styled(request.tool.clone(), t.fg(Role::Link)),
+        ]));
+        body.push(Line::default());
+    }
+    if let Some(map) = request.arguments.as_object().filter(|_| request.folder.is_none()) {
         let key_width = map.keys().map(|k| width(k)).max().unwrap_or(0).min(14);
         for (key, value) in map.iter().take(8) {
             let value = value
@@ -2298,12 +2319,13 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
         }
         body.push(Line::default());
     }
-    let always = format!("Always for {}", request.server);
+    let command = request.folder.is_some();
+    let always = if command { "Always run this here".to_string() } else { format!("Always for {}", request.server) };
     let options = [
-        ("Allow once", "enter"),
+        (if command { "Run it once" } else { "Allow once" }, "enter"),
         (always.as_str(), "a"),
-        ("Edit the arguments", "e"),
-        ("Deny", "esc"),
+        (if command { "Edit the command" } else { "Edit the arguments" }, "e"),
+        (if command { "Don't run it" } else { "Deny" }, "esc"),
     ];
     let mut option_rows = Vec::new();
     for (index, (label, key)) in options.iter().enumerate() {
@@ -2324,9 +2346,9 @@ pub fn approval_lines(pending: &PendingApproval, total_width: usize) -> Vec<Line
         };
         option_rows.push((line, selected));
     }
-    let kind = if request.writes { "MCP · writes data" } else { "MCP · reads data" };
+    let kind = if command { "runs on this computer" } else if request.writes { "MCP · writes data" } else { "MCP · reads data" };
     let g = t.glyphs();
-    let title = format!("{} Allow this tool? ", g.horizontal);
+    let title = format!("{} {} ", g.horizontal, if command { "Run this command?" } else { "Allow this tool?" });
     let right = format!(" {kind} {}", g.horizontal);
     let fill = (total_width.saturating_sub(2)).saturating_sub(width(&title) + width(&right));
     let mut out = vec![Line::styled(
@@ -2373,6 +2395,7 @@ pub fn draw(app: &App, buf: &mut Buffer, screen: Rect) {
         Some(Dialog::Memory(dialog)) => dialog.draw(app, buf, screen),
         Some(Dialog::About(dialog)) => dialog.draw(buf, screen),
         Some(Dialog::Effort(picker)) => picker.draw(app, buf, screen),
+        Some(Dialog::Folder(dialog)) => dialog.draw(app, buf, screen),
         None => {}
     }
 }
@@ -2398,6 +2421,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
         Dialog::Memory(dialog) => dialog.key(app, key),
         Dialog::About(dialog) => dialog.key(app, key),
         Dialog::Effort(picker) => picker.key(app, key),
+        Dialog::Folder(dialog) => dialog.key(app, key),
     };
     if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);

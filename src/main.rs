@@ -7,6 +7,7 @@ mod db;
 mod engine;
 mod export;
 mod files;
+mod folder;
 mod genui;
 mod imagegen;
 mod market;

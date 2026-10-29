@@ -61,6 +61,61 @@ pub fn copy_image(picture: &Picture) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// What Ctrl+V found on the clipboard.
+pub enum Clip {
+    Picture(crate::files::Attachment),
+    Files(Vec<std::path::PathBuf>),
+    Text(String),
+    Empty,
+}
+
+/// Read the system clipboard: a picture (as a PNG attachment), files copied
+/// in a file manager, or text.
+pub fn read_clipboard() -> Result<Clip, String> {
+    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    let slot = CLIPBOARD.get_or_init(|| Mutex::new(arboard::Clipboard::new().ok()));
+    let mut guard = slot.lock().map_err(|_| "the clipboard is busy".to_string())?;
+    let clipboard = guard.as_mut().ok_or("There is no clipboard here (no desktop session)")?;
+    if let Ok(files) = clipboard.get().file_list()
+        && !files.is_empty()
+    {
+        return Ok(Clip::Files(files));
+    }
+    if let Ok(image) = clipboard.get_image() {
+        let (w, h) = (image.width as u32, image.height as u32);
+        let pixels = image::RgbaImage::from_raw(w, h, image.bytes.into_owned()).ok_or("the picture on the clipboard is damaged")?;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        let size = crate::ui::picture::size_label(png.len());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        return Ok(Clip::Picture(crate::files::Attachment {
+            name: format!("pasted-picture-{}.png", chrono::Local::now().format("%H%M%S")),
+            kind: "image".into(),
+            mime: "image/png".into(),
+            text: None,
+            data_uri: Some(format!("data:image/png;base64,{encoded}")),
+            meta: format!("{w}×{h} · PNG · {size}"),
+        }));
+    }
+    match clipboard.get_text() {
+        Ok(text) if !text.is_empty() => Ok(Clip::Text(text)),
+        _ => Ok(Clip::Empty),
+    }
+}
+
+/// A pasted or dragged-in path to a picture on this computer, if that is all
+/// the text is (quotes and file:// taken off).
+pub fn picture_path(text: &str) -> Option<std::path::PathBuf> {
+    let t = text.trim().trim_matches(|c| c == '\'' || c == '"');
+    let t = t.strip_prefix("file://").unwrap_or(t);
+    let decoded = urlencoding::decode(t).map(|d| d.into_owned()).unwrap_or_else(|_| t.to_string());
+    let path = std::path::PathBuf::from(decoded.replace("\\ ", " "));
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    (["png", "jpg", "jpeg", "gif", "webp", "bmp"].contains(&ext.as_str()) && path.is_file()).then_some(path)
+}
+
 /// Copy to the system clipboard; over SSH or without a display, fall back to
 /// the terminal's OSC 52 clipboard.
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {

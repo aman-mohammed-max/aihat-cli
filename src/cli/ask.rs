@@ -32,6 +32,8 @@ pub struct Options {
     pub web: bool,
     /// off, low, medium or high, for this chat.
     pub effort: Option<String>,
+    /// Let the model read the current folder and ask to run commands there.
+    pub folder: bool,
     pub json: bool,
     pub stream: bool,
     pub continue_chat: bool,
@@ -164,6 +166,7 @@ pub fn run(env: &mut Env, options: Options) -> Result<i32> {
         model: model.clone(),
         messages,
         web: options.web,
+        folder: options.folder.then(|| std::env::current_dir().ok()).flatten(),
     };
     let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let mut sink = CliSink::new(stdout_tty, stderr_tty && !options.json, options.json || !options.stream, env.yes, width);
@@ -669,13 +672,22 @@ impl engine::Sink for CliSink {
         self.spinner.stop();
         let t = theme();
         let interactive = std::io::stdin().is_terminal();
-        eprintln!(
-            "{} {} wants to run {}",
-            paint("?", t.fg(Role::Warn)),
-            paint(&request.server, t.fg(Role::Strong)),
-            paint(&request.tool, t.fg(Role::Link))
-        );
-        if let Some(map) = request.arguments.as_object() {
+        if let Some(folder) = &request.folder {
+            let command = request.arguments.get("command").and_then(Value::as_str).unwrap_or("");
+            eprintln!("{} The assistant wants to run this in {}", paint("?", t.fg(Role::Warn)), paint(folder, t.fg(Role::Link)));
+            eprintln!("  {} {}", paint("$", t.fg(Role::Dim)), paint(command, t.bold(Role::Strong)));
+            if let Some(reason) = request.arguments.get("reason").and_then(Value::as_str) {
+                eprintln!("  {}", paint(reason, t.fg(Role::Dim)));
+            }
+        } else {
+            eprintln!(
+                "{} {} wants to run {}",
+                paint("?", t.fg(Role::Warn)),
+                paint(&request.server, t.fg(Role::Strong)),
+                paint(&request.tool, t.fg(Role::Link))
+            );
+        }
+        if let Some(map) = request.arguments.as_object().filter(|_| request.folder.is_none()) {
             let key_width = map.keys().map(|k| text::width(k)).max().unwrap_or(0).min(14);
             for (key, value) in map {
                 let value = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
@@ -686,7 +698,8 @@ impl engine::Sink for CliSink {
             eprintln!("{}", paint("  Denied: no terminal to ask. Pass --yes to allow tools that write.", t.fg(Role::Dim)));
             return Decision::Deny;
         }
-        eprint!("  {} ", paint("Allow? (y)es once · (a)lways for this server · (N)o", t.fg(Role::Dim)));
+        let question = if request.folder.is_some() { "Run it? (y)es once · (a)lways run this here · (N)o" } else { "Allow? (y)es once · (a)lways for this server · (N)o" };
+        eprint!("  {} ", paint(question, t.fg(Role::Dim)));
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
         let _ = std::io::stdin().read_line(&mut answer);

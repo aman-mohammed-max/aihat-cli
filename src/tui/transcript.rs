@@ -319,14 +319,16 @@ pub fn running_tool_lines(name: &str, detail: &str, elapsed_ms: u64, waiting: bo
     } else {
         format!("running… {}", text::seconds(elapsed_ms))
     };
+    // A spinner while it runs; the design's ● once it is done.
+    let mark = format!(" {} ", if waiting { "●" } else { super::anim::spinner() });
     if layout.narrow {
         return vec![Line::from(vec![
-            Span::styled(" ● ", t.fg(Role::Warn)),
+            Span::styled(mark, t.fg(Role::Warn)),
             Span::styled(format!("{name} · {summary}"), t.fg(Role::Dim)),
         ])];
     }
     let mut first = vec![
-        Span::styled(" ● ", t.fg(Role::Warn)),
+        Span::styled(mark, t.fg(Role::Warn)),
         Span::styled(name.to_string(), t.fg(Role::Dim)),
     ];
     if !detail.is_empty() {
@@ -357,6 +359,22 @@ fn tool_summary(log: &Value) -> (String, bool) {
             (format!("✗ {}", text::truncate(first, 90)), true)
         }
         "rejected" => ("denied".into(), false),
+        // A command: its exit code and how much it printed.
+        _ if log.get("name").and_then(Value::as_str) == Some("run_command") => {
+            let (output, code) = result.rsplit_once("\n\nexit code ").unwrap_or((result, "?"));
+            let lines = if output == "(no output)" { 0 } else { output.lines().count() };
+            (with_time(format!("exit code {code} · {}", text::plural(lines, "line", "lines"))), code != "0")
+        }
+        _ if matches!(log.get("name").and_then(Value::as_str), Some("list_files" | "search_files")) => {
+            let found = result.lines().filter(|line| !line.starts_with('…')).count();
+            let noun = if log["name"] == "list_files" { ("entry", "entries") } else { ("match", "matches") };
+            let text = if result.starts_with("No lines") { "no matches".to_string() } else { text::plural(found, noun.0, noun.1) };
+            (with_time(text), false)
+        }
+        _ if log.get("name").and_then(Value::as_str) == Some("read_file") => {
+            // "src/main.rs · lines 1–3 of 3"
+            (with_time(result.lines().next().unwrap_or("read").to_string()), false)
+        }
         _ if log.get("resultCount").is_some() => {
             let count = log["resultCount"].as_u64().unwrap_or(0) as usize;
             let pages = log.get("pagesRead").and_then(Value::as_u64).unwrap_or(0) as usize;

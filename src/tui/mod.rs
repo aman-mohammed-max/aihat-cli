@@ -1,11 +1,13 @@
 //! The full-screen chat: `aihat` with no arguments.
 
 mod about;
+mod anim;
 mod app;
 mod composer;
 mod dialogs;
 mod draw;
 mod files;
+mod folder;
 mod images;
 mod keys;
 mod market;
@@ -37,6 +39,7 @@ pub use tasks::test_endpoint;
 pub fn run(db: Database, paths: Paths, config: AppConfig, secrets: Secrets, initial_chat: Option<String>) -> Result<()> {
     let problems = keys::init(&config.keys);
     crate::ui::picture::settle(&config.images.preview);
+    anim::set_enabled(config.animations);
     let mut app = app::App::new(db, paths, config, secrets, initial_chat)?;
     if let Some(problem) = problems.first() {
         app.notify(crate::ui::theme::Role::Warn, problem.clone());
@@ -178,9 +181,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut a
             app.notice = None;
             dirty = true;
         }
-        // Timers ("Thinking… 3s") tick while something is running.
-        let animating = app.turn.is_some() || app.busy_task.is_some();
-        if dirty || (animating && last_draw.elapsed() >= Duration::from_millis(250)) {
+        // Timers ("Thinking… 3s") and spinners move while something runs.
+        let animating = app.turn.is_some() || app.busy_task.is_some() || app.drawing.is_some() || anim::intro_running();
+        let frame = if anim::enabled() { 90 } else { 250 };
+        if dirty || (animating && last_draw.elapsed() >= Duration::from_millis(frame)) {
             terminal.draw(|frame| view::draw(app, frame))?;
             last_draw = Instant::now();
             dirty = false;

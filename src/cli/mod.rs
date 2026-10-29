@@ -48,6 +48,9 @@ struct Cli {
     /// How much the model thinks: off, low, medium or high
     #[arg(short = 'e', long, global = true, value_name = "LEVEL", value_parser = ["off", "low", "medium", "high"])]
     effort: Option<String>,
+    /// Let the model read this folder's files and ask to run commands here
+    #[arg(long, global = true)]
+    folder: bool,
     /// Continue the last chat
     #[arg(short = 'c', long = "continue", global = true)]
     continue_chat: bool,
@@ -340,6 +343,7 @@ fn run() -> Result<i32> {
                     system: args.system,
                     web: args.web,
                     effort: args.effort,
+                    folder: args.folder,
                     json: args.json,
                     stream: !args.no_stream,
                     continue_chat: args.continue_chat,
